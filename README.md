@@ -2,11 +2,11 @@
 
 KM3Former is an open-source package developed under the High Energy Physics Institute, Tbilisi, Georgia, as part of the KM3NeT (Cubic Kilometre Neutrino Telescope) project. This repository contains a novel approach to muon reconstruction in neutrino telescopes using transformer-based deep learning models.
 
-##Overview
+## Overview
 
 The KM3Former package implements a transformer architecture tailored for processing KM3NeT detector data. It aims to improve the accuracy of muon trajectory reconstruction, particularly at high energies where traditional methods often struggle.
 
-##Key features:
+## Key features:
 
 - Transformer-based model for muon direction reconstruction
 - Optimized for KM3NeT detector data
