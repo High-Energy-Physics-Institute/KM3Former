@@ -21,9 +21,15 @@ Our research demonstrates significant improvements in muon reconstruction accura
 - Ability to capture complex patterns in detector data
 
 ## Installation
-[Include installation instructions here]
+```
+poetry install
+```
 ## Usage
-[Provide basic usage examples]
+```
+python pre-processing/pre_process.py
+python model/train.py
+```
+
 ## Contributing
 We welcome contributions to the KM3Former project. Please read our contributing guidelines before submitting pull requests.
 ## Future Work
@@ -36,7 +42,7 @@ We encourage further research in the following directions:
 
 ### Citation
 If you use KM3Former in your research, please cite our work:
-[Include citation information when available]
+
 
 ### Acknowledgments
 This work was developed as part of the KM3NeT collaboration. We thank all members of the High Energy Physics Institute, Tbilisi, Georgia, and the wider KM3NeT community for their support and contributions.
