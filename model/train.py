@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 
 import torch
 from data_loader import KM3Loader
@@ -7,12 +8,12 @@ from eval import (
     angular_error_degrees,
     combined_loss,
     evaluate_model,
+    move_batch_to_device,
     reconstruction_quality_target,
 )
 from km3former import KM3Former
 from scheduler import create_optimizer_and_scheduler
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 DATA_PATH = "./data"
@@ -40,7 +41,31 @@ def build_dataset(split_name):
     )
 
 
+def get_default_num_workers(max_workers=4):
+    if sys.platform == "darwin":
+        return 0
+
+    return min(max_workers, os.cpu_count() or 1)
+
+
+def build_data_loader(dataset, batch_size, shuffle, max_workers=4):
+    num_workers = get_default_num_workers(max_workers=max_workers)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    return DataLoader(dataset, **loader_kwargs)
+
+
 if __name__ == "__main__":
+    from torch.utils.tensorboard import SummaryWriter
+
     with open(f"{DATA_PATH}/metadata.json", "r", encoding="ascii") as metadata_file:
         metadata = json.load(metadata_file)
 
@@ -50,9 +75,24 @@ if __name__ == "__main__":
     val_dataset = build_dataset("val")
     test_dataset = build_dataset("test")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = build_data_loader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        max_workers=4,
+    )
+    val_loader = build_data_loader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        max_workers=2,
+    )
+    test_loader = build_data_loader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        max_workers=2,
+    )
 
     train_steps = len(train_loader) * epochs
     warmup_steps = max(1, int(0.05 * train_steps))
@@ -87,11 +127,14 @@ if __name__ == "__main__":
         for batch_idx, (hits, raw_hits, padding_mask, muons, rec_muons) in enumerate(
             tqdm(train_loader, desc="Training", leave=False)
         ):
-            hits = hits.to(device)
-            raw_hits = raw_hits.to(device)
-            padding_mask = padding_mask.to(device)
-            muons = muons.to(device)
-            rec_muons = rec_muons.to(device)
+            hits, raw_hits, padding_mask, muons, rec_muons = move_batch_to_device(
+                hits,
+                raw_hits,
+                padding_mask,
+                muons,
+                rec_muons,
+                device=device,
+            )
 
             optimizer.zero_grad()
             prediction, quality = model(

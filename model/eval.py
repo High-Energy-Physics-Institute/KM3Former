@@ -30,6 +30,11 @@ def combined_loss(prediction, target, quality_prediction=None, quality_target=No
     return loss
 
 
+def move_batch_to_device(*tensors, device):
+    non_blocking = device.type == "cuda"
+    return tuple(tensor.to(device, non_blocking=non_blocking) for tensor in tensors)
+
+
 @torch.no_grad()
 def evaluate_model(model, data_loader, device):
     model.eval()
@@ -38,11 +43,14 @@ def evaluate_model(model, data_loader, device):
     total_examples = 0
 
     for hits, raw_hits, padding_mask, muons, rec_muons in data_loader:
-        hits = hits.to(device)
-        raw_hits = raw_hits.to(device)
-        padding_mask = padding_mask.to(device)
-        muons = muons.to(device)
-        rec_muons = rec_muons.to(device)
+        hits, raw_hits, padding_mask, muons, rec_muons = move_batch_to_device(
+            hits,
+            raw_hits,
+            padding_mask,
+            muons,
+            rec_muons,
+            device=device,
+        )
 
         prediction, quality = model(
             hits,
