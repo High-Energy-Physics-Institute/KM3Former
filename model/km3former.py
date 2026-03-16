@@ -71,6 +71,7 @@ class KM3Former(nn.Module):
         valid_mask = (~padding_mask).unsqueeze(-1)
         src = self.embedding(src) * math.sqrt(self.model_dim)
         src = self.positional_encoding(src)
+        # Zero padded tokens before attention so they do not leak through residual paths.
         src = src * valid_mask
 
         attention_bias = self.pairwise_bias(
@@ -116,6 +117,7 @@ class MaskedAttentionPooling(nn.Module):
         if padding_mask is not None:
             weights = weights.masked_fill(padding_mask, 0.0)
 
+        # Renormalize after masking so only valid hits contribute to the event embedding.
         weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
         return torch.sum(memory * weights.unsqueeze(-1), dim=1)
 
@@ -137,6 +139,7 @@ class PairwiseAttentionBias(nn.Module):
         positions = raw_hits[..., 1:4]
         directions = raw_hits[..., 4:7]
 
+        # Build physics-motivated pair features for each hit pair.
         delta_t = times.unsqueeze(2) - times.unsqueeze(1)
         delta_pos = positions.unsqueeze(2) - positions.unsqueeze(1)
         distance = torch.linalg.norm(delta_pos, dim=-1)
@@ -165,6 +168,7 @@ class PairwiseAttentionBias(nn.Module):
         )
         attention_bias = self.bias_mlp(pair_features).permute(0, 3, 1, 2)
 
+        # Keep attention local in time and space instead of fully dense O(N^2) connectivity.
         allowed_pairs = self.build_sparse_attention_mask(
             delta_t=delta_t,
             distance=distance,
@@ -214,9 +218,11 @@ class PairwiseAttentionBias(nn.Module):
 
         allowed_pairs = allowed_time | allowed_space
         if padding_mask is not None:
+            # Padded hits cannot be attended to as keys.
             valid_keys = (~padding_mask).unsqueeze(1)
             allowed_pairs = allowed_pairs & valid_keys
 
+        # Always allow self-attention so every hit retains a valid path through the layer.
         diagonal = torch.eye(num_hits, dtype=torch.bool, device=device).unsqueeze(0)
         return allowed_pairs | diagonal
 
@@ -238,5 +244,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
+        # `x` is batch-first: [batch, hits, dim].
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)

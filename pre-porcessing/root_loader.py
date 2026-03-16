@@ -66,6 +66,7 @@ def _build_hits_tensor(event, max_hits):
     if max_hits is not None:
         sort_indices = sort_indices[:max_hits]
 
+    # Keep raw times here; the shared preprocessing step will convert them to relative time.
     hit_time = hit_time[sort_indices]
 
     pos_x = torch.tensor(_to_numpy(event.hits.pos_x), dtype=torch.float32)[sort_indices]
@@ -74,6 +75,7 @@ def _build_hits_tensor(event, max_hits):
     dir_x = torch.tensor(_to_numpy(event.hits.dir_x), dtype=torch.float32)[sort_indices]
     dir_y = torch.tensor(_to_numpy(event.hits.dir_y), dtype=torch.float32)[sort_indices]
     dir_z = torch.tensor(_to_numpy(event.hits.dir_z), dtype=torch.float32)[sort_indices]
+    # Keep TOT untransformed here so all deterministic normalization lives in one module.
     tot = torch.tensor(_to_numpy(event.hits.tot), dtype=torch.float32)[sort_indices]
 
     num_hits = hit_time.shape[0]

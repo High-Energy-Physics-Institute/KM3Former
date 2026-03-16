@@ -28,15 +28,19 @@ def apply_deterministic_hit_transforms(hits_list, position_scale=DEFAULT_POSITIO
             transformed_hits.append(transformed)
             continue
 
+        # Keep event timing relative so each event starts from a shared reference.
         transformed[:, TIME_INDEX] = transformed[:, TIME_INDEX] - transformed[
             :, TIME_INDEX
         ].min()
+        # Scale detector coordinates by a fixed detector length instead of a fitted scaler.
         transformed[:, POSITION_SLICE] = (
             transformed[:, POSITION_SLICE] / position_scale
         )
+        # Compress the long TOT tail with a deterministic physics-friendly transform.
         transformed[:, TOT_INDEX] = torch.log1p(
             torch.clamp(transformed[:, TOT_INDEX], min=0.0)
         )
+        # Radius is derived from x/y, so keep it on the same fixed spatial scale.
         transformed[:, RADIUS_INDEX] = transformed[:, RADIUS_INDEX] / position_scale
         transformed_hits.append(transformed)
 
@@ -56,6 +60,7 @@ def compute_feature_stats(
     mean = torch.zeros(n_features, dtype=torch.float32)
     std = torch.ones(n_features, dtype=torch.float32)
 
+    # Only standardize the continuous scalar features; direction vectors stay untouched.
     index_tensor = torch.tensor(feature_indices, dtype=torch.long)
     selected = all_data[:, index_tensor]
     mean[index_tensor] = selected.mean(dim=0)

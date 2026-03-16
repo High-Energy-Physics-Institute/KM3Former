@@ -81,6 +81,7 @@ def save_split(
     raw_hits,
     hit_stats,
 ):
+    # Persist both views: one for the model input and one for pairwise geometry features.
     transformed_hits = apply_deterministic_hit_transforms(
         raw_hits,
         position_scale=POSITION_SCALE,
@@ -110,6 +111,7 @@ if __name__ == "__main__":
         raise RuntimeError("No events were loaded from the ROOT files.")
 
     split_indices = build_split_indices(len(hits))
+    # Fit global affine stats on the training split only after deterministic transforms.
     train_hits = apply_deterministic_hit_transforms(
         take_items(hits, split_indices["train"]),
         position_scale=POSITION_SCALE,
@@ -147,4 +149,5 @@ if __name__ == "__main__":
     with open(f"{DATA_PATH}/metadata.json", "w", encoding="ascii") as metadata_file:
         json.dump(metadata, metadata_file, indent=2)
 
+    # Save one compact tensor stats file instead of feature-by-feature sklearn scalers.
     save_feature_stats(hit_stats, f"{DATA_PATH}/hits_stats.pt")
