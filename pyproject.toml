@@ -13,6 +13,8 @@ joblib = "^1.4.2"
 pandas = "^2.2.2"
 awkward = "^2.6.6"
 tqdm = "^4.66.4"
+scikit-learn = "^1.5.1"
+tensorboard = "^2.17.1"
 
 
 [build-system]

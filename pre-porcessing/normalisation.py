@@ -3,88 +3,108 @@ import torch
 from sklearn.preprocessing import StandardScaler
 
 
-def normalize_tensor_list(tensor_list):
-    # Convert list of tensors to a numpy array
-    data = np.array([t.numpy() for t in tensor_list])
-
-    # Initialize a list to store scalers
+def fit_tensor_list_scalers(tensor_list):
+    data = np.stack([tensor.detach().cpu().numpy() for tensor in tensor_list], axis=0)
     scalers = []
 
-    # Initialize an array to store normalized data
-    normalized_data = np.zeros_like(data)
-
-    # Normalize each component separately
-    for i in range(data.shape[1]):
+    for feature_idx in range(data.shape[1]):
         scaler = StandardScaler()
-        normalized_data[:, i] = scaler.fit_transform(
-            data[:, i].reshape(-1, 1)
-        ).flatten()
+        scaler.fit(data[:, feature_idx].reshape(-1, 1))
         scalers.append(scaler)
 
-    # Convert back to a list of PyTorch tensors
-    normalized_list = [
-        torch.tensor(row, dtype=torch.float32) for row in normalized_data
-    ]
+    return scalers
 
+
+def apply_tensor_list_scalers(tensor_list, scalers):
+    data = np.stack([tensor.detach().cpu().numpy() for tensor in tensor_list], axis=0)
+    normalized_data = np.zeros_like(data, dtype=np.float32)
+
+    for feature_idx, scaler in enumerate(scalers):
+        normalized_data[:, feature_idx] = scaler.transform(
+            data[:, feature_idx].reshape(-1, 1)
+        ).reshape(-1)
+
+    return [torch.tensor(row, dtype=torch.float32) for row in normalized_data]
+
+
+def normalize_tensor_list(tensor_list):
+    scalers = fit_tensor_list_scalers(tensor_list)
+    normalized_list = apply_tensor_list_scalers(tensor_list, scalers)
     return normalized_list, scalers
 
 
 def denormalize_tensor_list(normalized_list, scalers):
-    # Convert list of tensors to a numpy array
-    normalized_data = np.array([t.numpy() for t in normalized_list])
+    normalized_data = np.stack(
+        [tensor.detach().cpu().numpy() for tensor in normalized_list], axis=0
+    )
 
-    # Initialize an array to store denormalized data
-    denormalized_data = np.zeros_like(normalized_data)
+    denormalized_data = np.zeros_like(normalized_data, dtype=np.float32)
+    for feature_idx, scaler in enumerate(scalers):
+        denormalized_data[:, feature_idx] = scaler.inverse_transform(
+            normalized_data[:, feature_idx].reshape(-1, 1)
+        ).reshape(-1)
 
-    # Denormalize each component separately
-    for i in range(normalized_data.shape[1]):
-        denormalized_data[:, i] = (
-            scalers[i].inverse_transform(normalized_data[:, i].reshape(-1, 1)).flatten()
+    return [torch.tensor(row, dtype=torch.float32) for row in denormalized_data]
+
+
+def fit_nested_tensor_list_scalers(hits_list):
+    n_features = hits_list[0].shape[1]
+    scalers = [StandardScaler() for _ in range(n_features)]
+    all_data = torch.cat(hits_list, dim=0).detach().cpu().numpy()
+
+    for feature_idx, scaler in enumerate(scalers):
+        scaler.fit(all_data[:, feature_idx].reshape(-1, 1))
+
+    return scalers
+
+
+def apply_nested_tensor_list_scalers(hits_list, scalers):
+    n_features = hits_list[0].shape[1]
+    all_data = torch.cat(hits_list, dim=0).detach().cpu().numpy()
+    normalized_data = np.zeros_like(all_data, dtype=np.float32)
+
+    for feature_idx, scaler in enumerate(scalers):
+        normalized_data[:, feature_idx] = scaler.transform(
+            all_data[:, feature_idx].reshape(-1, 1)
+        ).reshape(-1)
+
+    normalized_hits = []
+    start = 0
+    for hit_tensor in hits_list:
+        end = start + hit_tensor.shape[0]
+        normalized_hits.append(
+            torch.tensor(normalized_data[start:end], dtype=torch.float32)
         )
+        start = end
 
-    # Convert back to a list of PyTorch tensors
-    denormalized_list = [
-        torch.tensor(row, dtype=torch.float32) for row in denormalized_data
-    ]
-
-    return denormalized_list
+    return normalized_hits
 
 
 def normalize_nested_tensor_list(hits_list, scalers=None):
-    # Get the dimensions
-    n_samples = len(hits_list)
-    n_hits, n_features = hits_list[0].shape
-
-    # Initialize or reuse scalers
     if scalers is None:
-        scalers = [StandardScaler() for _ in range(n_features)]
-        fit_scalers = True
-    else:
-        fit_scalers = False
+        scalers = fit_nested_tensor_list_scalers(hits_list)
 
-    # Prepare data for scaling
-    flat_data = [hit.view(-1, n_features) for hit in hits_list]
-    all_data = torch.cat(flat_data, dim=0).numpy()
+    normalized_hits = apply_nested_tensor_list_scalers(hits_list, scalers)
+    return normalized_hits, scalers
 
-    # Fit scalers (if necessary) and transform data
-    normalized_data = np.zeros_like(all_data)
-    for i in range(n_features):
-        if fit_scalers:
-            normalized_data[:, i] = (
-                scalers[i].fit_transform(all_data[:, i].reshape(-1, 1)).flatten()
-            )
-        else:
-            normalized_data[:, i] = (
-                scalers[i].transform(all_data[:, i].reshape(-1, 1)).flatten()
-            )
 
-    # Reshape normalized data back to original structure
-    normalized_hits = []
+def denormalize_nested_tensor_list(normalized_hits, scalers):
+    n_features = normalized_hits[0].shape[1]
+    all_data = torch.cat(normalized_hits, dim=0).detach().cpu().numpy()
+    denormalized_data = np.zeros_like(all_data, dtype=np.float32)
+
+    for feature_idx, scaler in enumerate(scalers):
+        denormalized_data[:, feature_idx] = scaler.inverse_transform(
+            all_data[:, feature_idx].reshape(-1, 1)
+        ).reshape(-1)
+
+    denormalized_hits = []
     start = 0
-    for hit in hits_list:
-        end = start + hit.shape[0]
-        normalized_hit = torch.tensor(normalized_data[start:end], dtype=torch.float32)
-        normalized_hits.append(normalized_hit)
+    for hit_tensor in normalized_hits:
+        end = start + hit_tensor.shape[0]
+        denormalized_hits.append(
+            torch.tensor(denormalized_data[start:end], dtype=torch.float32)
+        )
         start = end
 
-    return normalized_hits, scalers
+    return denormalized_hits

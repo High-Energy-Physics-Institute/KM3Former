@@ -9,7 +9,9 @@ The KM3Former package implements a transformer architecture tailored for process
 ## Key features:
 
 - Transformer-based model for muon direction reconstruction
-- Optimized for KM3NeT detector data
+- Split-aware preprocessing with train-only feature scaling
+- Time-sorted hits with event-relative timing, log-TOT, and padding masks
+- Geometry-aware pairwise attention bias and sparse attention neighborhoods
 - Scalable to large datasets
 - Improved accuracy compared to classical reconstruction methods
 
@@ -26,8 +28,8 @@ poetry install
 ```
 ## Usage
 ```
-python pre-processing/pre_process.py
-python model/train.py
+python3 pre-porcessing/pre_process.py
+python3 model/train.py
 ```
 
 ## Contributing
