@@ -67,7 +67,6 @@ def _build_hits_tensor(event, max_hits):
         sort_indices = sort_indices[:max_hits]
 
     hit_time = hit_time[sort_indices]
-    hit_time = hit_time - hit_time[0]
 
     pos_x = torch.tensor(_to_numpy(event.hits.pos_x), dtype=torch.float32)[sort_indices]
     pos_y = torch.tensor(_to_numpy(event.hits.pos_y), dtype=torch.float32)[sort_indices]
@@ -75,12 +74,7 @@ def _build_hits_tensor(event, max_hits):
     dir_x = torch.tensor(_to_numpy(event.hits.dir_x), dtype=torch.float32)[sort_indices]
     dir_y = torch.tensor(_to_numpy(event.hits.dir_y), dtype=torch.float32)[sort_indices]
     dir_z = torch.tensor(_to_numpy(event.hits.dir_z), dtype=torch.float32)[sort_indices]
-    log_tot = torch.log1p(
-        torch.clamp(
-            torch.tensor(_to_numpy(event.hits.tot), dtype=torch.float32)[sort_indices],
-            min=0.0,
-        )
-    )
+    tot = torch.tensor(_to_numpy(event.hits.tot), dtype=torch.float32)[sort_indices]
 
     num_hits = hit_time.shape[0]
     if num_hits == 1:
@@ -98,7 +92,7 @@ def _build_hits_tensor(event, max_hits):
             dir_x,
             dir_y,
             dir_z,
-            log_tot,
+            tot,
             hit_rank,
             radius_xy,
         ],

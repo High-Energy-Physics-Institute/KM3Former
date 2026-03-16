@@ -1,9 +1,15 @@
 import json
 import os
 
-import joblib
 import torch
-from normalisation import apply_nested_tensor_list_scalers, fit_nested_tensor_list_scalers
+from normalisation import (
+    DEFAULT_AFFINE_FEATURE_INDICES,
+    DEFAULT_POSITION_SCALE,
+    apply_deterministic_hit_transforms,
+    apply_feature_stats,
+    compute_feature_stats,
+    save_feature_stats,
+)
 from padding import pad_tensor
 from root_loader import process_path
 
@@ -26,6 +32,8 @@ FEATURE_NAMES = [
     "hit_rank",
     "radius_xy",
 ]
+POSITION_SCALE = DEFAULT_POSITION_SCALE
+AFFINE_FEATURE_NAMES = [FEATURE_NAMES[index] for index in DEFAULT_AFFINE_FEATURE_INDICES]
 
 
 def build_split_indices(num_samples):
@@ -64,11 +72,23 @@ def pad_hits_list(hits_list, max_hits):
     return torch.stack(padded_hits), torch.stack(padding_masks)
 
 
-def save_split(data_path, split_name, muons, rec_muons, muon_energies, raw_hits, hit_scalers):
-    normalized_hits = apply_nested_tensor_list_scalers(raw_hits, hit_scalers)
+def save_split(
+    data_path,
+    split_name,
+    muons,
+    rec_muons,
+    muon_energies,
+    raw_hits,
+    hit_stats,
+):
+    transformed_hits = apply_deterministic_hit_transforms(
+        raw_hits,
+        position_scale=POSITION_SCALE,
+    )
+    normalized_hits = apply_feature_stats(transformed_hits, hit_stats)
 
     final_hits, final_masks = pad_hits_list(normalized_hits, max_hits=MAX_HITS)
-    final_raw_hits, _ = pad_hits_list(raw_hits, max_hits=MAX_HITS)
+    final_raw_hits, _ = pad_hits_list(transformed_hits, max_hits=MAX_HITS)
 
     torch.save(torch.stack(muons), f"{data_path}/{split_name}_muons.pt")
     torch.save(torch.stack(rec_muons), f"{data_path}/{split_name}_muons_rec.pt")
@@ -80,7 +100,6 @@ def save_split(data_path, split_name, muons, rec_muons, muon_energies, raw_hits,
 
 if __name__ == "__main__":
     os.makedirs(DATA_PATH, exist_ok=True)
-    os.makedirs(f"{DATA_PATH}/scalers", exist_ok=True)
 
     muons, hits, rec_muons, muon_energies = process_path(
         f"{DATA_PATH}{ROOT_PATH_PATTERN}",
@@ -91,8 +110,11 @@ if __name__ == "__main__":
         raise RuntimeError("No events were loaded from the ROOT files.")
 
     split_indices = build_split_indices(len(hits))
-    train_hits = take_items(hits, split_indices["train"])
-    hits_scalers = fit_nested_tensor_list_scalers(train_hits)
+    train_hits = apply_deterministic_hit_transforms(
+        take_items(hits, split_indices["train"]),
+        position_scale=POSITION_SCALE,
+    )
+    hit_stats = compute_feature_stats(train_hits)
 
     for split_name, indices in split_indices.items():
         save_split(
@@ -102,7 +124,7 @@ if __name__ == "__main__":
             rec_muons=take_items(rec_muons, indices),
             muon_energies=take_items(muon_energies, indices),
             raw_hits=take_items(hits, indices),
-            hit_scalers=hits_scalers,
+            hit_stats=hit_stats,
         )
 
     metadata = {
@@ -111,9 +133,18 @@ if __name__ == "__main__":
         "feature_names": FEATURE_NAMES,
         "splits": {split_name: len(indices) for split_name, indices in split_indices.items()},
         "split_seed": SPLIT_SEED,
+        "normalization": {
+            "raw_hits": "deterministic physics transforms",
+            "normalized_hits": "deterministic physics transforms + global affine stats",
+            "position_scale": POSITION_SCALE,
+            "affine_feature_indices": list(DEFAULT_AFFINE_FEATURE_INDICES),
+            "affine_feature_names": AFFINE_FEATURE_NAMES,
+            "unchanged_feature_names": ["dir_x", "dir_y", "dir_z"],
+            "time_reference": "per-event minimum hit time",
+            "tot_transform": "log1p(clamp(tot, min=0))",
+        },
     }
     with open(f"{DATA_PATH}/metadata.json", "w", encoding="ascii") as metadata_file:
         json.dump(metadata, metadata_file, indent=2)
 
-    for scaler_index, scaler in enumerate(hits_scalers):
-        joblib.dump(scaler, f"{DATA_PATH}/scalers/hits_scaler{scaler_index}.joblib")
+    save_feature_stats(hit_stats, f"{DATA_PATH}/hits_stats.pt")
