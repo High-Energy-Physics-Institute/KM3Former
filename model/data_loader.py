@@ -10,6 +10,7 @@ class KM3Loader(Dataset):
         padding_mask_file,
         label_file,
         rec_label_file=None,
+        energy_label_file=None,
         load_strategy="lazy",
     ):
         if load_strategy not in {"eager", "lazy"}:
@@ -25,8 +26,11 @@ class KM3Loader(Dataset):
             ("padding_mask", padding_mask_file),
             ("labels", label_file),
         ]
+        # Keep optional targets append-only so older datasets still load unchanged.
         if rec_label_file is not None:
             self._tensor_specs.append(("rec_labels", rec_label_file))
+        if energy_label_file is not None:
+            self._tensor_specs.append(("energy_labels", energy_label_file))
 
         self._tensors = None
         if self.load_strategy == "eager":
@@ -40,6 +44,7 @@ class KM3Loader(Dataset):
             (name, path, torch.load(path, map_location="cpu"))
             for name, path in self._tensor_specs
         ]
+        # Fail early if a partially written preprocessing run produced misaligned tensors.
         self._validate_loaded_entries(loaded_entries)
 
         loaded_map = {name: tensor for name, _, tensor in loaded_entries}
@@ -49,6 +54,7 @@ class KM3Loader(Dataset):
             loaded_map["padding_mask"],
             loaded_map["labels"],
             loaded_map.get("rec_labels"),
+            loaded_map.get("energy_labels"),
         )
         return self._tensors
 
@@ -79,11 +85,13 @@ class KM3Loader(Dataset):
             )
 
     def __len__(self):
-        hits, _, _, _, _ = self._ensure_loaded()
+        hits, _, _, _, _, _ = self._ensure_loaded()
         return len(hits)
 
     def __getitem__(self, idx):
-        hits, raw_hits, padding_mask, labels, rec_labels = self._ensure_loaded()
+        hits, raw_hits, padding_mask, labels, rec_labels, energy_labels = (
+            self._ensure_loaded()
+        )
         sample = (
             hits[idx],
             raw_hits[idx],
@@ -91,6 +99,13 @@ class KM3Loader(Dataset):
             labels[idx],
         )
         if rec_labels is None:
-            return sample
+            if energy_labels is None:
+                return sample
+            # When no reconstructed labels exist, energy is the only optional trailing field.
+            return sample + (energy_labels[idx],)
 
-        return sample + (rec_labels[idx],)
+        if energy_labels is None:
+            return sample + (rec_labels[idx],)
+
+        # The supervised training path expects reconstructed direction before energy.
+        return sample + (rec_labels[idx], energy_labels[idx])

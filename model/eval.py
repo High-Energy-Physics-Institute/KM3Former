@@ -2,6 +2,22 @@ import torch
 import torch.nn.functional as F
 
 
+def unpack_supervised_batch(batch):
+    # The current training loop is direction-supervised, with optional future energy labels.
+    if len(batch) == 5:
+        hits, raw_hits, padding_mask, muons, rec_muons = batch
+        return hits, raw_hits, padding_mask, muons, rec_muons, None
+
+    if len(batch) == 6:
+        hits, raw_hits, padding_mask, muons, rec_muons, energy_labels = batch
+        return hits, raw_hits, padding_mask, muons, rec_muons, energy_labels
+
+    raise ValueError(
+        "Expected supervised batches with 5 or 6 tensors, "
+        f"received {len(batch)} entries."
+    )
+
+
 def cosine_direction_loss(prediction, target):
     prediction = F.normalize(prediction, dim=-1)
     target = F.normalize(target, dim=-1)
@@ -42,15 +58,17 @@ def evaluate_model(model, data_loader, device):
     total_angle = 0.0
     total_examples = 0
 
-    for hits, raw_hits, padding_mask, muons, rec_muons in data_loader:
-        hits, raw_hits, padding_mask, muons, rec_muons = move_batch_to_device(
-            hits,
-            raw_hits,
-            padding_mask,
-            muons,
-            rec_muons,
-            device=device,
+    for batch in data_loader:
+        hits, raw_hits, padding_mask, muons, rec_muons, energy_labels = (
+            unpack_supervised_batch(batch)
         )
+        tensors_to_move = [hits, raw_hits, padding_mask, muons, rec_muons]
+        if energy_labels is not None:
+            tensors_to_move.append(energy_labels)
+
+        moved_tensors = move_batch_to_device(*tensors_to_move, device=device)
+        # Ignore optional energy labels for now; they are only carried through for future heads.
+        hits, raw_hits, padding_mask, muons, rec_muons = moved_tensors[:5]
 
         prediction, quality = model(
             hits,

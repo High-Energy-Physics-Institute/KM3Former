@@ -1,0 +1,23 @@
+{
+  "paths": {
+    "data_path": "./data",
+    "model_path": "./model"
+  },
+  "model": {
+    "model_dim": 256,
+    "num_heads": 8,
+    "num_encoder_layers": 6,
+    "dim_feedforward": 512,
+    "dropout": 0.1,
+    "pairwise_neighbors": 32
+  },
+  "training": {
+    "batch_size": 256,
+    "learning_rate": 0.0008,
+    "epochs": 10
+  },
+  "loader": {
+    "train_max_workers": 4,
+    "eval_max_workers": 2
+  }
+}

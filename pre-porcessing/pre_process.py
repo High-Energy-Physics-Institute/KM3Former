@@ -72,6 +72,55 @@ def pad_hits_list(hits_list, max_hits):
     return torch.stack(padded_hits), torch.stack(padding_masks)
 
 
+def build_metadata(split_indices):
+    # Keep the legacy filename for compatibility, but describe the tensor by its actual role.
+    return {
+        "max_hits": MAX_HITS,
+        "input_dim": len(FEATURE_NAMES),
+        "feature_names": FEATURE_NAMES,
+        "splits": {
+            split_name: len(indices) for split_name, indices in split_indices.items()
+        },
+        "split_seed": SPLIT_SEED,
+        "saved_tensors": {
+            "hits.pt": {
+                "semantic_role": "model_input",
+                "description": "deterministic transforms followed by train-fit affine normalization",
+            },
+            "hits_raw.pt": {
+                "semantic_role": "pairwise_bias_input",
+                "description": "legacy filename; contains deterministic geometry/time transforms for pairwise bias, not untouched ROOT hits",
+            },
+            "padding_mask.pt": {
+                "semantic_role": "padding_mask",
+                "description": "boolean mask where True marks padded hit rows",
+            },
+            "muons.pt": {
+                "semantic_role": "truth_direction",
+                "description": "normalized Monte Carlo muon direction",
+            },
+            "muons_rec.pt": {
+                "semantic_role": "reconstructed_direction",
+                "description": "normalized reconstructed track direction chosen by the ranking heuristic",
+            },
+            "muons_e.pt": {
+                "semantic_role": "auxiliary_energy_label",
+                "description": "Monte Carlo muon energy reserved for future multi-task training",
+            },
+        },
+        "normalization": {
+            "pairwise_bias_input": "deterministic physics transforms only",
+            "model_input": "deterministic physics transforms + global affine stats",
+            "position_scale": POSITION_SCALE,
+            "affine_feature_indices": list(DEFAULT_AFFINE_FEATURE_INDICES),
+            "affine_feature_names": AFFINE_FEATURE_NAMES,
+            "unchanged_feature_names": ["dir_x", "dir_y", "dir_z"],
+            "time_reference": "per-event minimum hit time",
+            "tot_transform": "log1p(clamp(tot, min=0))",
+        },
+    }
+
+
 def save_split(
     data_path,
     split_name,
@@ -89,13 +138,14 @@ def save_split(
     normalized_hits = apply_feature_stats(transformed_hits, hit_stats)
 
     final_hits, final_masks = pad_hits_list(normalized_hits, max_hits=MAX_HITS)
-    final_raw_hits, _ = pad_hits_list(transformed_hits, max_hits=MAX_HITS)
+    # This tensor keeps deterministic geometry/time features for pairwise attention bias.
+    final_pairwise_hits, _ = pad_hits_list(transformed_hits, max_hits=MAX_HITS)
 
     torch.save(torch.stack(muons), f"{data_path}/{split_name}_muons.pt")
     torch.save(torch.stack(rec_muons), f"{data_path}/{split_name}_muons_rec.pt")
     torch.save(torch.tensor(muon_energies, dtype=torch.float32), f"{data_path}/{split_name}_muons_e.pt")
     torch.save(final_hits, f"{data_path}/{split_name}_hits.pt")
-    torch.save(final_raw_hits, f"{data_path}/{split_name}_hits_raw.pt")
+    torch.save(final_pairwise_hits, f"{data_path}/{split_name}_hits_raw.pt")
     torch.save(final_masks, f"{data_path}/{split_name}_padding_mask.pt")
 
 
@@ -129,23 +179,7 @@ if __name__ == "__main__":
             hit_stats=hit_stats,
         )
 
-    metadata = {
-        "max_hits": MAX_HITS,
-        "input_dim": len(FEATURE_NAMES),
-        "feature_names": FEATURE_NAMES,
-        "splits": {split_name: len(indices) for split_name, indices in split_indices.items()},
-        "split_seed": SPLIT_SEED,
-        "normalization": {
-            "raw_hits": "deterministic physics transforms",
-            "normalized_hits": "deterministic physics transforms + global affine stats",
-            "position_scale": POSITION_SCALE,
-            "affine_feature_indices": list(DEFAULT_AFFINE_FEATURE_INDICES),
-            "affine_feature_names": AFFINE_FEATURE_NAMES,
-            "unchanged_feature_names": ["dir_x", "dir_y", "dir_z"],
-            "time_reference": "per-event minimum hit time",
-            "tot_transform": "log1p(clamp(tot, min=0))",
-        },
-    }
+    metadata = build_metadata(split_indices=split_indices)
     with open(f"{DATA_PATH}/metadata.json", "w", encoding="ascii") as metadata_file:
         json.dump(metadata, metadata_file, indent=2)
 

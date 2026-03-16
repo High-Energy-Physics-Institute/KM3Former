@@ -63,6 +63,7 @@ Core dependencies:
 - `torch`
 - `km3io`
 - `awkward`
+- `click`
 - `tensorboard`
 - `scikit-learn`
 - `tqdm`
@@ -84,6 +85,8 @@ Commands:
 ```bash
 uv run python pre-porcessing/pre_process.py
 uv run python model/train.py
+uv run python model/train.py --config configs/train.default.json
+uv run python model/infer.py --checkpoint-path ./model/best_model.pth --split test --output-path ./model/test_predictions.pt
 uv run pytest
 ```
 
@@ -143,27 +146,32 @@ That means the sequence dimension now has a defined meaning:
 - the transformer's positional encoding is applied over time-sorted hit order
 - truncation to `MAX_HITS` keeps the earliest hits rather than arbitrary file order
 
-Current hit features per row:
+Current hit fields produced by `_build_hits_tensor()` before deterministic transforms:
 
-1. `relative_t`
+1. `hit_t`
 2. `pos_x`
 3. `pos_y`
 4. `pos_z`
 5. `dir_x`
 6. `dir_y`
 7. `dir_z`
-8. `log_tot`
+8. `tot`
 9. `hit_rank`
 10. `radius_xy`
 
-Feature meanings:
+Feature meanings at the ROOT-loading stage:
 
-- `relative_t`: hit time after subtracting the first hit time in the event
+- `hit_t`: raw hit time before per-event re-anchoring
 - `pos_x`, `pos_y`, `pos_z`: detector coordinates
 - `dir_x`, `dir_y`, `dir_z`: PMT or hit orientation direction
-- `log_tot`: charge-like TOT feature after logarithmic compression
+- `tot`: charge-like TOT feature before logarithmic compression
 - `hit_rank`: normalized hit order index from 0 to 1 within the event
 - `radius_xy`: radial distance in the detector transverse plane, computed as `sqrt(x^2 + y^2)`
+
+After deterministic preprocessing:
+
+- `*_hits.pt` stores the normalized model-input view, where `hit_t` becomes event-relative time and `tot` becomes `log_tot`
+- `*_hits_raw.pt` keeps the legacy filename but now stores the deterministic pairwise-bias view, not untouched ROOT hits
 
 The truth label saved as `*_muons.pt` is the normalized MC direction vector `[dir_x, dir_y, dir_z]`.
 
@@ -281,7 +289,7 @@ It also writes:
 Meaning of the saved tensors:
 
 - `*_hits.pt`: normalized transformer inputs
-- `*_hits_raw.pt`: deterministically transformed but not affine-normalized hit features used for pairwise attention bias
+- `*_hits_raw.pt`: legacy filename for the deterministically transformed pairwise-bias input view
 - `*_padding_mask.pt`: boolean mask marking padded rows
 - `*_muons.pt`: normalized truth direction vectors
 - `*_muons_rec.pt`: normalized reconstructed direction vectors
@@ -311,6 +319,8 @@ When reconstructed labels are provided, each dataset sample is a 5-tuple:
 5. reconstructed muon direction
 
 If reconstructed labels are omitted, the sample becomes a 4-tuple without the final item.
+
+If energy labels are also provided, they are appended after the reconstructed direction so existing supervised consumers keep the same leading fields.
 
 ### Validation checks
 
@@ -573,18 +583,28 @@ Training writes outputs under `./model/`:
 
 - `model_epoch_1.pth`, `model_epoch_2.pth`, ...
 - `best_model.pth`
+- `resolved_train_config.json`
 - `tensorboard/`
 
 ## Tests
 
-The current automated tests live in [test_data_loader.py](./tests/test_data_loader.py).
+The current automated tests live in:
+
+- [test_data_loader.py](./tests/test_data_loader.py)
+- [test_preprocessing.py](./tests/test_preprocessing.py)
+- [test_train_and_infer.py](./tests/test_train_and_infer.py)
 
 They cover:
 
 - lazy and eager dataset loading returning identical samples
+- optional energy-label loading without breaking older dataset shapes
 - behavior when reconstructed labels are omitted
 - validation of mismatched tensor lengths
 - expected batch shapes from the DataLoader
+- deterministic preprocessing transforms and padding-mask alignment
+- metadata semantics for saved tensor roles
+- config resolution and model construction smoke coverage
+- checkpoint loading and inference smoke coverage
 - safe macOS worker defaults
 - Linux worker and pinned-memory defaults
 - `move_batch_to_device()` behavior
@@ -599,9 +619,12 @@ uv run pytest
 
 - The scripts assume they are run from the repository root because they use relative paths like `./data` and `./model`.
 - Preprocessing must run before training.
-- The code stores both normalized hits and raw geometry-aware hits because the transformer uses them for different purposes.
+- The code stores both normalized hits and a deterministic pairwise-bias view because the transformer uses them for different purposes.
+- `*_hits_raw.pt` is a legacy filename and no longer means untouched ROOT hit values.
 - The padding mask uses `True` for fake padded rows, matching PyTorch transformer conventions.
 - The truth and reconstructed directions are normalized before being saved.
+- Training now supports a JSON config file through a `click` CLI and saves the resolved run config next to checkpoints.
+- Inference currently targets already-preprocessed tensors only; it does not run directly from ROOT files.
 
 ## Current limitations
 
@@ -614,10 +637,10 @@ Important limitations that still remain:
 - no explicit causal residual term such as `delta_t - distance / v_light_in_water`
 - no dedicated energy regression head yet
 - no uncertainty calibration beyond the simple proxy quality head
-- no dedicated inference script or experiment configuration system
+- the experiment configuration and inference tooling are still minimal rather than a full experiment-management stack
 - no ablation framework for comparing model variants
 
-There is also one implementation detail worth being aware of: the current preprocessing flow already constructs `relative_t` and `log_tot` in the ROOT-loading stage, and then runs deterministic transforms again before saving final tensors. If you continue iterating on the preprocessing, that is a good area to review carefully so the exact intended transform path stays explicit.
+There is also one implementation detail worth being aware of: the ROOT-loading stage now keeps raw hit time and TOT, while deterministic transforms are applied centrally before tensors are saved. The legacy `*_hits_raw.pt` filename still refers to the transformed pairwise-bias view rather than untouched detector hits, so that distinction is a good one to keep explicit as preprocessing evolves.
 
 ## Suggested next improvements
 
@@ -627,7 +650,7 @@ If you want to keep pushing this toward a more KM3NeT-specific architecture, the
 2. add a more explicit causal physics feature in the pairwise bias
 3. add energy or uncertainty heads for multi-task training
 4. evaluate learned `[CLS]` pooling or a hybrid pooling strategy
-5. add experiment configs and reproducible training scripts
+5. extend the JSON config and inference utilities into a fuller experiment-management and ablation workflow
 6. add end-to-end tests for preprocessing and a real training smoke test
 
 ## Acknowledgments

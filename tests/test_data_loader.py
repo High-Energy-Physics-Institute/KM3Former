@@ -30,7 +30,12 @@ class KM3LoaderTestCase(unittest.TestCase):
         torch.save(tensor, path)
         return path
 
-    def _write_dataset_files(self, include_rec_labels=True, label_length=2):
+    def _write_dataset_files(
+        self,
+        include_rec_labels=True,
+        include_energy_labels=False,
+        label_length=2,
+    ):
         hits = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
         raw_hits = hits + 100.0
         padding_mask = torch.tensor(
@@ -51,6 +56,12 @@ class KM3LoaderTestCase(unittest.TestCase):
         if include_rec_labels:
             rec_labels = labels + 10.0
             paths["rec_label_file"] = self._write_tensor("rec_labels", rec_labels)
+        if include_energy_labels:
+            energy_labels = torch.tensor([100.0, 200.0], dtype=torch.float32)
+            paths["energy_label_file"] = self._write_tensor(
+                "energy_labels",
+                energy_labels,
+            )
 
         return paths
 
@@ -104,6 +115,26 @@ class KM3LoaderTestCase(unittest.TestCase):
         moved_batch = move_batch_to_device(*batch, device=torch.device("cpu"))
         for original, moved in zip(batch, moved_batch):
             self.assertTrue(torch.equal(original, moved))
+
+    def test_loader_with_energy_labels_returns_six_item_samples(self):
+        dataset_kwargs = self._write_dataset_files(include_energy_labels=True)
+        dataset = KM3Loader(load_strategy="lazy", **dataset_kwargs)
+
+        sample = dataset[0]
+        self.assertEqual(len(sample), 6)
+        self.assertEqual(sample[4].shape, torch.Size([3]))
+        self.assertEqual(sample[5].shape, torch.Size([]))
+
+    def test_loader_without_rec_labels_can_still_return_energy_labels(self):
+        dataset_kwargs = self._write_dataset_files(
+            include_rec_labels=False,
+            include_energy_labels=True,
+        )
+        dataset = KM3Loader(load_strategy="lazy", **dataset_kwargs)
+
+        sample = dataset[0]
+        self.assertEqual(len(sample), 5)
+        self.assertEqual(sample[4].shape, torch.Size([]))
 
     def test_build_data_loader_uses_mac_safe_defaults(self):
         dataset_kwargs = self._write_dataset_files()

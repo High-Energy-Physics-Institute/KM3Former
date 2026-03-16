@@ -2,7 +2,9 @@ import json
 import os
 import sys
 
+import click
 import torch
+from config import get_model_init_kwargs, resolve_train_config, save_json_file
 from data_loader import KM3Loader
 from eval import (
     angular_error_degrees,
@@ -10,34 +12,29 @@ from eval import (
     evaluate_model,
     move_batch_to_device,
     reconstruction_quality_target,
+    unpack_supervised_batch,
 )
 from km3former import KM3Former
 from scheduler import create_optimizer_and_scheduler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-DATA_PATH = "./data"
-MODEL_PATH = "./model"
-
-model_dim = 256
-num_heads = 8
-num_encoder_layers = 6
-dim_feedforward = 512
-dropout = 0.1
-pairwise_neighbors = 32
-batch_size = 256
-
-learning_rate = 8e-4
-epochs = 10
+DEFAULT_RESOLVED_CONFIG_PATH = "resolved_train_config.json"
 
 
-def build_dataset(split_name):
+def build_dataset(split_name, data_path, load_strategy="lazy"):
+    rec_label_file = f"{data_path}/{split_name}_muons_rec.pt"
+    energy_label_file = f"{data_path}/{split_name}_muons_e.pt"
     return KM3Loader(
-        hits_file=f"{DATA_PATH}/{split_name}_hits.pt",
-        raw_hits_file=f"{DATA_PATH}/{split_name}_hits_raw.pt",
-        padding_mask_file=f"{DATA_PATH}/{split_name}_padding_mask.pt",
-        label_file=f"{DATA_PATH}/{split_name}_muons.pt",
-        rec_label_file=f"{DATA_PATH}/{split_name}_muons_rec.pt",
+        hits_file=f"{data_path}/{split_name}_hits.pt",
+        raw_hits_file=f"{data_path}/{split_name}_hits_raw.pt",
+        padding_mask_file=f"{data_path}/{split_name}_padding_mask.pt",
+        label_file=f"{data_path}/{split_name}_muons.pt",
+        rec_label_file=rec_label_file if os.path.exists(rec_label_file) else None,
+        energy_label_file=(
+            energy_label_file if os.path.exists(energy_label_file) else None
+        ),
+        load_strategy=load_strategy,
     )
 
 
@@ -63,51 +60,82 @@ def build_data_loader(dataset, batch_size, shuffle, max_workers=4):
     return DataLoader(dataset, **loader_kwargs)
 
 
-if __name__ == "__main__":
+def load_metadata(data_path):
+    with open(f"{data_path}/metadata.json", "r", encoding="ascii") as metadata_file:
+        return json.load(metadata_file)
+
+
+def build_model(metadata, resolved_config, device):
+    # Metadata owns tensor shape; config owns architectural hyperparameters.
+    return KM3Former(
+        **get_model_init_kwargs(
+            metadata=metadata,
+            resolved_config=resolved_config,
+        )
+    ).to(device)
+
+
+def get_cli_overrides(data_path=None, model_path=None):
+    overrides = {}
+    if data_path is not None:
+        overrides.setdefault("paths", {})["data_path"] = data_path
+    if model_path is not None:
+        overrides.setdefault("paths", {})["model_path"] = model_path
+    return overrides
+
+
+def train_model(resolved_config):
     from torch.utils.tensorboard import SummaryWriter
 
-    with open(f"{DATA_PATH}/metadata.json", "r", encoding="ascii") as metadata_file:
-        metadata = json.load(metadata_file)
+    data_path = resolved_config["paths"]["data_path"]
+    model_path = resolved_config["paths"]["model_path"]
+    batch_size = resolved_config["training"]["batch_size"]
+    learning_rate = resolved_config["training"]["learning_rate"]
+    epochs = resolved_config["training"]["epochs"]
+    train_max_workers = resolved_config["loader"]["train_max_workers"]
+    eval_max_workers = resolved_config["loader"]["eval_max_workers"]
 
-    os.makedirs(MODEL_PATH, exist_ok=True)
+    metadata = load_metadata(data_path=data_path)
 
-    train_dataset = build_dataset("train")
-    val_dataset = build_dataset("val")
-    test_dataset = build_dataset("test")
+    os.makedirs(model_path, exist_ok=True)
+    # Save the final merged config so each checkpoint directory is self-describing.
+    save_json_file(
+        resolved_config,
+        f"{model_path}/{DEFAULT_RESOLVED_CONFIG_PATH}",
+    )
+
+    train_dataset = build_dataset("train", data_path=data_path)
+    val_dataset = build_dataset("val", data_path=data_path)
+    test_dataset = build_dataset("test", data_path=data_path)
 
     train_loader = build_data_loader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        max_workers=4,
+        max_workers=train_max_workers,
     )
     val_loader = build_data_loader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        max_workers=2,
+        max_workers=eval_max_workers,
     )
     test_loader = build_data_loader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        max_workers=2,
+        max_workers=eval_max_workers,
     )
 
     train_steps = len(train_loader) * epochs
     warmup_steps = max(1, int(0.05 * train_steps))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = KM3Former(
-        input_dim=metadata["input_dim"],
-        model_dim=model_dim,
-        num_heads=num_heads,
-        num_encoder_layers=num_encoder_layers,
-        dim_feedforward=dim_feedforward,
-        dropout=dropout,
-        max_hits=metadata["max_hits"],
-        pairwise_neighbors=pairwise_neighbors,
-    ).to(device)
+    model = build_model(
+        metadata=metadata,
+        resolved_config=resolved_config,
+        device=device,
+    )
 
     optimizer, lr_scheduler = create_optimizer_and_scheduler(
         model=model,
@@ -116,7 +144,7 @@ if __name__ == "__main__":
         learning_rate=learning_rate,
     )
 
-    writer = SummaryWriter(log_dir=f"{MODEL_PATH}/tensorboard")
+    writer = SummaryWriter(log_dir=f"{model_path}/tensorboard")
     best_val_loss = float("inf")
     model.train()
 
@@ -124,17 +152,19 @@ if __name__ == "__main__":
         running_loss = 0.0
         running_angle = 0.0
 
-        for batch_idx, (hits, raw_hits, padding_mask, muons, rec_muons) in enumerate(
+        for batch_idx, batch in enumerate(
             tqdm(train_loader, desc="Training", leave=False)
         ):
-            hits, raw_hits, padding_mask, muons, rec_muons = move_batch_to_device(
-                hits,
-                raw_hits,
-                padding_mask,
-                muons,
-                rec_muons,
-                device=device,
+            hits, raw_hits, padding_mask, muons, rec_muons, energy_labels = (
+                unpack_supervised_batch(batch)
             )
+            tensors_to_move = [hits, raw_hits, padding_mask, muons, rec_muons]
+            if energy_labels is not None:
+                tensors_to_move.append(energy_labels)
+
+            moved_tensors = move_batch_to_device(*tensors_to_move, device=device)
+            # Optional energy labels are only moved through the pipeline for future tasks.
+            hits, raw_hits, padding_mask, muons, rec_muons = moved_tensors[:5]
 
             optimizer.zero_grad()
             prediction, quality = model(
@@ -181,22 +211,23 @@ if __name__ == "__main__":
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": lr_scheduler.state_dict(),
             "val_loss": val_metrics["loss"],
+            "resolved_config": resolved_config,
         }
-        torch.save(checkpoint, f"{MODEL_PATH}/model_epoch_{epoch + 1}.pth")
+        torch.save(checkpoint, f"{model_path}/model_epoch_{epoch + 1}.pth")
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            torch.save(checkpoint, f"{MODEL_PATH}/best_model.pth")
+            torch.save(checkpoint, f"{model_path}/best_model.pth")
 
-    best_checkpoint = torch.load(f"{MODEL_PATH}/best_model.pth", map_location=device)
+    best_checkpoint = torch.load(f"{model_path}/best_model.pth", map_location=device)
     model.load_state_dict(best_checkpoint["model_state_dict"])
     test_metrics = evaluate_model(model, test_loader, device=device)
     writer.add_hparams(
         {
             "learning_rate": learning_rate,
             "batch_size": batch_size,
-            "pairwise_neighbors": pairwise_neighbors,
-            "model_dim": model_dim,
+            "pairwise_neighbors": resolved_config["model"]["pairwise_neighbors"],
+            "model_dim": resolved_config["model"]["model_dim"],
         },
         {
             "hparam/test_loss": test_metrics["loss"],
@@ -204,3 +235,39 @@ if __name__ == "__main__":
         },
     )
     writer.close()
+    return test_metrics
+
+
+@click.command()
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Optional JSON config file. Defaults stay identical when omitted.",
+)
+@click.option(
+    "--data-path",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Override the configured preprocessing data directory.",
+)
+@click.option(
+    "--model-path",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Override the configured output directory for checkpoints and logs.",
+)
+def main(config_path, data_path, model_path):
+    resolved_config = resolve_train_config(
+        config_path=config_path,
+        overrides=get_cli_overrides(
+            data_path=data_path,
+            model_path=model_path,
+        ),
+    )
+    train_model(resolved_config=resolved_config)
+
+
+if __name__ == "__main__":
+    main()
