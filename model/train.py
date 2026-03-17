@@ -10,9 +10,8 @@ from eval import (
     angular_error_degrees,
     combined_loss,
     evaluate_model,
-    move_batch_to_device,
+    move_batch_dict_to_device,
     reconstruction_quality_target,
-    unpack_supervised_batch,
 )
 from km3former import KM3Former
 from scheduler import create_optimizer_and_scheduler
@@ -36,6 +35,17 @@ def build_dataset(split_name, data_path, load_strategy="lazy"):
         ),
         load_strategy=load_strategy,
     )
+
+
+def resolve_quality_supervision(*datasets):
+    availability = [dataset.has_rec_labels for dataset in datasets]
+    if any(availability) and not all(availability):
+        raise ValueError(
+            "Reconstructed labels must be present for all train/val/test splits "
+            "or omitted for all of them."
+        )
+
+    return all(availability)
 
 
 def get_default_num_workers(max_workers=4):
@@ -107,6 +117,11 @@ def train_model(resolved_config):
     train_dataset = build_dataset("train", data_path=data_path)
     val_dataset = build_dataset("val", data_path=data_path)
     test_dataset = build_dataset("test", data_path=data_path)
+    quality_supervised = resolve_quality_supervision(
+        train_dataset,
+        val_dataset,
+        test_dataset,
+    )
 
     train_loader = build_data_loader(
         train_dataset,
@@ -155,25 +170,27 @@ def train_model(resolved_config):
         for batch_idx, batch in enumerate(
             tqdm(train_loader, desc="Training", leave=False)
         ):
-            hits, raw_hits, padding_mask, muons, rec_muons, energy_labels = (
-                unpack_supervised_batch(batch)
-            )
-            tensors_to_move = [hits, raw_hits, padding_mask, muons, rec_muons]
-            if energy_labels is not None:
-                tensors_to_move.append(energy_labels)
-
-            moved_tensors = move_batch_to_device(*tensors_to_move, device=device)
-            # Optional energy labels are only moved through the pipeline for future tasks.
-            hits, raw_hits, padding_mask, muons, rec_muons = moved_tensors[:5]
+            batch = move_batch_dict_to_device(batch, device=device)
+            hits = batch["hits"]
+            raw_hits = batch["raw_hits"]
+            padding_mask = batch["padding_mask"]
+            muons = batch["muons"]
 
             optimizer.zero_grad()
-            prediction, quality = model(
+            model_output = model(
                 hits,
                 raw_hits=raw_hits,
                 padding_mask=padding_mask,
-                return_quality=True,
+                return_quality=quality_supervised,
             )
-            quality_target = reconstruction_quality_target(rec_muons, muons)
+            if quality_supervised:
+                prediction, quality = model_output
+            else:
+                prediction = model_output
+                quality = None
+            quality_target = None
+            if quality_supervised:
+                quality_target = reconstruction_quality_target(batch["rec_muons"], muons)
             loss = combined_loss(
                 prediction,
                 muons,
@@ -196,7 +213,12 @@ def train_model(resolved_config):
 
         average_train_loss = running_loss / max(len(train_loader), 1)
         average_train_angle = running_angle / max(len(train_loader), 1)
-        val_metrics = evaluate_model(model, val_loader, device=device)
+        val_metrics = evaluate_model(
+            model,
+            val_loader,
+            device=device,
+            quality_supervised=quality_supervised,
+        )
         current_lr = lr_scheduler.get_last_lr()[0]
 
         writer.add_scalar("Loss/Train_Epoch", average_train_loss, epoch)
@@ -212,6 +234,7 @@ def train_model(resolved_config):
             "scheduler_state_dict": lr_scheduler.state_dict(),
             "val_loss": val_metrics["loss"],
             "resolved_config": resolved_config,
+            "quality_supervised": quality_supervised,
         }
         torch.save(checkpoint, f"{model_path}/model_epoch_{epoch + 1}.pth")
 
@@ -221,7 +244,12 @@ def train_model(resolved_config):
 
     best_checkpoint = torch.load(f"{model_path}/best_model.pth", map_location=device)
     model.load_state_dict(best_checkpoint["model_state_dict"])
-    test_metrics = evaluate_model(model, test_loader, device=device)
+    test_metrics = evaluate_model(
+        model,
+        test_loader,
+        device=device,
+        quality_supervised=quality_supervised,
+    )
     writer.add_hparams(
         {
             "learning_rate": learning_rate,

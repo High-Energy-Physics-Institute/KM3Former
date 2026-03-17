@@ -93,28 +93,33 @@ def build_inference_loader(hits, raw_hits, padding_mask, batch_size):
 
 
 @torch.no_grad()
-def predict_batches(model, data_loader, device):
+def predict_batches(model, data_loader, device, quality_supervised):
     predictions = []
-    quality_scores = []
+    quality_scores = [] if quality_supervised else None
 
     for hits, raw_hits, padding_mask in data_loader:
         hits = hits.to(device)
         raw_hits = raw_hits.to(device)
         padding_mask = padding_mask.to(device)
 
-        batch_predictions, batch_quality = model(
+        model_output = model(
             hits,
             raw_hits=raw_hits,
             padding_mask=padding_mask,
-            return_quality=True,
+            return_quality=quality_supervised,
         )
+        if quality_supervised:
+            batch_predictions, batch_quality = model_output
+        else:
+            batch_predictions = model_output
         predictions.append(batch_predictions.cpu())
-        quality_scores.append(batch_quality.cpu())
+        if quality_supervised:
+            quality_scores.append(batch_quality.cpu())
 
-    return {
-        "predictions": torch.cat(predictions, dim=0),
-        "quality": torch.cat(quality_scores, dim=0),
-    }
+    output = {"predictions": torch.cat(predictions, dim=0)}
+    if quality_supervised:
+        output["quality"] = torch.cat(quality_scores, dim=0)
+    return output
 
 
 def save_inference_output(output_path, payload):
@@ -166,6 +171,7 @@ def run_inference(
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     checkpoint = torch.load(checkpoint_path, map_location=resolved_device)
+    quality_supervised = checkpoint.get("quality_supervised", True)
     model, resolved_config = build_model_from_checkpoint(
         metadata=metadata,
         checkpoint=checkpoint,
@@ -181,6 +187,7 @@ def run_inference(
         model=model,
         data_loader=data_loader,
         device=resolved_device,
+        quality_supervised=quality_supervised,
     )
 
     payload = {
@@ -190,11 +197,13 @@ def run_inference(
         "stats_path": resolved_stats_path,
         "input_paths": input_paths,
         "resolved_config": resolved_config,
+        "supports_quality": quality_supervised,
         "feature_mean_shape": list(feature_stats["mean"].shape),
         "feature_std_shape": list(feature_stats["std"].shape),
         "predictions": predictions["predictions"],
-        "quality": predictions["quality"],
     }
+    if quality_supervised:
+        payload["quality"] = predictions["quality"]
     save_inference_output(output_path=output_path, payload=payload)
     return payload
 

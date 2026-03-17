@@ -17,7 +17,7 @@ DEFAULT_TRAIN_CONFIG = {
         "pairwise_neighbors": 32,
     },
     "training": {
-        "batch_size": 256,
+        "batch_size": 64,
         "learning_rate": 8e-4,
         "epochs": 10,
     },

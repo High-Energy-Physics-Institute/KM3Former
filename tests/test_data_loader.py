@@ -13,7 +13,7 @@ if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
 from data_loader import KM3Loader
-from eval import move_batch_to_device
+from eval import move_batch_dict_to_device, move_batch_to_device
 from train import build_data_loader
 
 
@@ -75,19 +75,19 @@ class KM3LoaderTestCase(unittest.TestCase):
 
         eager_sample = eager_dataset[1]
         lazy_sample = lazy_dataset[1]
-        self.assertEqual(len(eager_sample), len(lazy_sample))
+        self.assertEqual(set(eager_sample), set(lazy_sample))
 
-        for eager_tensor, lazy_tensor in zip(eager_sample, lazy_sample):
-            self.assertTrue(torch.equal(eager_tensor, lazy_tensor))
+        for key in eager_sample:
+            self.assertTrue(torch.equal(eager_sample[key], lazy_sample[key]))
 
     def test_loader_without_rec_labels_returns_four_item_samples(self):
         dataset_kwargs = self._write_dataset_files(include_rec_labels=False)
         dataset = KM3Loader(load_strategy="lazy", **dataset_kwargs)
 
         sample = dataset[0]
-        self.assertEqual(len(sample), 4)
-        self.assertEqual(sample[0].shape, torch.Size([3, 4]))
-        self.assertEqual(sample[2].dtype, torch.bool)
+        self.assertEqual(set(sample), {"hits", "raw_hits", "padding_mask", "muons"})
+        self.assertEqual(sample["hits"].shape, torch.Size([3, 4]))
+        self.assertEqual(sample["padding_mask"].dtype, torch.bool)
 
     def test_mismatched_tensor_lengths_raise_value_error(self):
         dataset_kwargs = self._write_dataset_files(label_length=1)
@@ -104,16 +104,28 @@ class KM3LoaderTestCase(unittest.TestCase):
         loader = DataLoader(dataset, batch_size=2, shuffle=False)
 
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 5)
-        self.assertEqual(batch[0].shape, torch.Size([2, 3, 4]))
-        self.assertEqual(batch[1].shape, torch.Size([2, 3, 4]))
-        self.assertEqual(batch[2].shape, torch.Size([2, 3]))
-        self.assertEqual(batch[3].shape, torch.Size([2, 3]))
-        self.assertEqual(batch[4].shape, torch.Size([2, 3]))
-        self.assertEqual(batch[2].dtype, torch.bool)
+        self.assertEqual(set(batch), {"hits", "raw_hits", "padding_mask", "muons", "rec_muons"})
+        self.assertEqual(batch["hits"].shape, torch.Size([2, 3, 4]))
+        self.assertEqual(batch["raw_hits"].shape, torch.Size([2, 3, 4]))
+        self.assertEqual(batch["padding_mask"].shape, torch.Size([2, 3]))
+        self.assertEqual(batch["muons"].shape, torch.Size([2, 3]))
+        self.assertEqual(batch["rec_muons"].shape, torch.Size([2, 3]))
+        self.assertEqual(batch["padding_mask"].dtype, torch.bool)
 
-        moved_batch = move_batch_to_device(*batch, device=torch.device("cpu"))
-        for original, moved in zip(batch, moved_batch):
+        moved_batch = move_batch_dict_to_device(batch, device=torch.device("cpu"))
+        for key in batch:
+            self.assertTrue(torch.equal(batch[key], moved_batch[key]))
+
+        moved_tuple = move_batch_to_device(
+            batch["hits"],
+            batch["raw_hits"],
+            batch["padding_mask"],
+            device=torch.device("cpu"),
+        )
+        for original, moved in zip(
+            (batch["hits"], batch["raw_hits"], batch["padding_mask"]),
+            moved_tuple,
+        ):
             self.assertTrue(torch.equal(original, moved))
 
     def test_loader_with_energy_labels_returns_six_item_samples(self):
@@ -121,9 +133,12 @@ class KM3LoaderTestCase(unittest.TestCase):
         dataset = KM3Loader(load_strategy="lazy", **dataset_kwargs)
 
         sample = dataset[0]
-        self.assertEqual(len(sample), 6)
-        self.assertEqual(sample[4].shape, torch.Size([3]))
-        self.assertEqual(sample[5].shape, torch.Size([]))
+        self.assertEqual(
+            set(sample),
+            {"hits", "raw_hits", "padding_mask", "muons", "rec_muons", "energy"},
+        )
+        self.assertEqual(sample["rec_muons"].shape, torch.Size([3]))
+        self.assertEqual(sample["energy"].shape, torch.Size([]))
 
     def test_loader_without_rec_labels_can_still_return_energy_labels(self):
         dataset_kwargs = self._write_dataset_files(
@@ -133,8 +148,11 @@ class KM3LoaderTestCase(unittest.TestCase):
         dataset = KM3Loader(load_strategy="lazy", **dataset_kwargs)
 
         sample = dataset[0]
-        self.assertEqual(len(sample), 5)
-        self.assertEqual(sample[4].shape, torch.Size([]))
+        self.assertEqual(
+            set(sample),
+            {"hits", "raw_hits", "padding_mask", "muons", "energy"},
+        )
+        self.assertEqual(sample["energy"].shape, torch.Size([]))
 
     def test_build_data_loader_uses_mac_safe_defaults(self):
         dataset_kwargs = self._write_dataset_files()

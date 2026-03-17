@@ -14,7 +14,7 @@ if str(MODEL_DIR) not in sys.path:
 
 from config import DEFAULT_TRAIN_CONFIG, resolve_train_config
 from infer import main as infer_cli, run_inference
-from train import build_model, main as train_cli
+from train import build_model, main as train_cli, resolve_quality_supervision
 
 
 class TrainConfigAndInferenceTestCase(unittest.TestCase):
@@ -142,6 +142,7 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
             {
                 "model_state_dict": model.state_dict(),
                 "resolved_config": resolved_config,
+                "quality_supervised": True,
             },
             checkpoint_path,
         )
@@ -161,6 +162,7 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         self.assertTrue(output_path.exists())
         self.assertEqual(payload["predictions"].shape, torch.Size([2, 3]))
         self.assertEqual(payload["quality"].shape, torch.Size([2]))
+        self.assertTrue(payload["supports_quality"])
 
     def test_click_inference_cli_smoke_runs(self):
         metadata, hits_path, raw_hits_path, padding_mask_path = self._write_runtime_files()
@@ -189,6 +191,7 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
             {
                 "model_state_dict": model.state_dict(),
                 "resolved_config": resolved_config,
+                "quality_supervised": True,
             },
             checkpoint_path,
         )
@@ -218,6 +221,68 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertTrue(output_path.exists())
+
+    def test_inference_omits_quality_for_direction_only_checkpoint(self):
+        metadata, hits_path, raw_hits_path, padding_mask_path = self._write_runtime_files()
+        resolved_config = resolve_train_config(
+            overrides={
+                "paths": {
+                    "data_path": str(self.data_dir),
+                    "model_path": str(self.model_dir),
+                },
+                "model": {
+                    "model_dim": 64,
+                    "num_heads": 4,
+                    "num_encoder_layers": 2,
+                    "dim_feedforward": 128,
+                    "pairwise_neighbors": 8,
+                },
+            }
+        )
+        model = build_model(
+            metadata=metadata,
+            resolved_config=resolved_config,
+            device=torch.device("cpu"),
+        )
+        checkpoint_path = self.workspace / "model" / "direction_only_checkpoint.pth"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "resolved_config": resolved_config,
+                "quality_supervised": False,
+            },
+            checkpoint_path,
+        )
+
+        payload = run_inference(
+            checkpoint_path=str(checkpoint_path),
+            output_path=str(self.workspace / "direction_only_predictions.pt"),
+            data_path=str(self.data_dir),
+            hits_file=str(hits_path),
+            raw_hits_file=str(raw_hits_path),
+            padding_mask_file=str(padding_mask_path),
+            batch_size=1,
+            device="cpu",
+        )
+
+        self.assertEqual(payload["predictions"].shape, torch.Size([2, 3]))
+        self.assertFalse(payload["supports_quality"])
+        self.assertNotIn("quality", payload)
+
+    def test_resolve_quality_supervision_rejects_mixed_split_capabilities(self):
+        class DatasetStub:
+            def __init__(self, has_rec_labels):
+                self.has_rec_labels = has_rec_labels
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Reconstructed labels must be present",
+        ):
+            resolve_quality_supervision(
+                DatasetStub(True),
+                DatasetStub(False),
+                DatasetStub(True),
+            )
 
 
 if __name__ == "__main__":

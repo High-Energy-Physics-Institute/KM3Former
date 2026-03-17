@@ -5,6 +5,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def gather_token_neighbors(token_tensor, neighbor_indices):
+    batch_size, num_hits, _ = neighbor_indices.shape
+    head_count = token_tensor.size(1)
+    head_dim = token_tensor.size(-1)
+
+    flattened_tokens = token_tensor.permute(0, 2, 1, 3).reshape(
+        batch_size * token_tensor.size(2),
+        head_count,
+        head_dim,
+    )
+    batch_offsets = (
+        torch.arange(batch_size, device=neighbor_indices.device).view(batch_size, 1, 1)
+        * token_tensor.size(2)
+    )
+    flattened_indices = (neighbor_indices + batch_offsets).reshape(-1)
+    gathered = flattened_tokens[flattened_indices].reshape(
+        batch_size,
+        num_hits,
+        neighbor_indices.size(-1),
+        head_count,
+        head_dim,
+    )
+    return gathered.permute(0, 3, 1, 2, 4)
+
+
+def gather_hit_neighbors(hit_tensor, neighbor_indices):
+    batch_size, num_hits, _ = neighbor_indices.shape
+    feature_dim = hit_tensor.size(-1)
+
+    flattened_hits = hit_tensor.reshape(batch_size * hit_tensor.size(1), feature_dim)
+    batch_offsets = (
+        torch.arange(batch_size, device=neighbor_indices.device).view(batch_size, 1, 1)
+        * hit_tensor.size(1)
+    )
+    flattened_indices = (neighbor_indices + batch_offsets).reshape(-1)
+    return flattened_hits[flattened_indices].reshape(
+        batch_size,
+        num_hits,
+        neighbor_indices.size(-1),
+        feature_dim,
+    )
+
+
 class KM3Former(nn.Module):
     def __init__(
         self,
@@ -32,22 +75,15 @@ class KM3Former(nn.Module):
             dropout=dropout,
             max_len=max_hits,
         )
-        self.pairwise_bias = PairwiseAttentionBias(
-            num_heads=num_heads,
-            hidden_dim=pairwise_hidden_dim or model_dim,
-            time_neighbors=pairwise_neighbors,
-            spatial_neighbors=pairwise_neighbors,
-        )
         self.encoder_layers = nn.ModuleList(
             [
-                nn.TransformerEncoderLayer(
-                    d_model=model_dim,
-                    nhead=num_heads,
+                SparseNeighborhoodEncoderLayer(
+                    model_dim=model_dim,
+                    num_heads=num_heads,
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
+                    pairwise_hidden_dim=pairwise_hidden_dim or model_dim,
+                    pairwise_neighbors=pairwise_neighbors,
                 )
                 for _ in range(num_encoder_layers)
             ]
@@ -71,21 +107,16 @@ class KM3Former(nn.Module):
         valid_mask = (~padding_mask).unsqueeze(-1)
         src = self.embedding(src) * math.sqrt(self.model_dim)
         src = self.positional_encoding(src)
-        # Zero padded tokens before attention so they do not leak through residual paths.
         src = src * valid_mask
-
-        attention_bias = self.pairwise_bias(
-            raw_hits=raw_hits,
-            padding_mask=padding_mask,
-        )
 
         memory = src
         for encoder_layer in self.encoder_layers:
             memory = encoder_layer(
                 memory,
-                src_mask=attention_bias,
-                src_key_padding_mask=padding_mask,
+                raw_hits=raw_hits,
+                padding_mask=padding_mask,
             )
+            memory = memory * valid_mask
 
         memory = self.final_norm(memory) * valid_mask
         pooled = self.pooler(memory, padding_mask=padding_mask)
@@ -96,6 +127,234 @@ class KM3Former(nn.Module):
             return direction, quality
 
         return direction
+
+
+class SparseNeighborhoodEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        model_dim,
+        num_heads,
+        dim_feedforward,
+        dropout,
+        pairwise_hidden_dim,
+        pairwise_neighbors,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(model_dim)
+        self.self_attention = SparseNeighborhoodSelfAttention(
+            model_dim=model_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            pairwise_hidden_dim=pairwise_hidden_dim,
+            time_neighbors=pairwise_neighbors,
+            spatial_neighbors=pairwise_neighbors,
+        )
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(model_dim)
+        self.linear1 = nn.Linear(model_dim, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, model_dim)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, src, raw_hits, padding_mask):
+        src = src + self.dropout1(
+            self.self_attention(
+                self.norm1(src),
+                raw_hits=raw_hits,
+                padding_mask=padding_mask,
+            )
+        )
+        src = src + self._feed_forward_block(self.norm2(src))
+        return src
+
+    def _feed_forward_block(self, src):
+        src = self.linear1(src)
+        src = F.gelu(src)
+        src = self.dropout(src)
+        src = self.linear2(src)
+        return self.dropout2(src)
+
+
+class SparseNeighborhoodSelfAttention(nn.Module):
+    def __init__(
+        self,
+        model_dim,
+        num_heads,
+        dropout,
+        pairwise_hidden_dim,
+        time_neighbors=32,
+        spatial_neighbors=32,
+        spatial_chunk_size=64,
+    ):
+        super().__init__()
+        if model_dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads.")
+
+        self.model_dim = model_dim
+        self.num_heads = num_heads
+        self.head_dim = model_dim // num_heads
+        self.time_neighbors = time_neighbors
+        self.spatial_neighbors = spatial_neighbors
+        self.spatial_chunk_size = spatial_chunk_size
+
+        self.q_proj = nn.Linear(model_dim, model_dim)
+        self.k_proj = nn.Linear(model_dim, model_dim)
+        self.v_proj = nn.Linear(model_dim, model_dim)
+        self.out_proj = nn.Linear(model_dim, model_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.pairwise_bias = PairwiseAttentionBias(
+            num_heads=num_heads,
+            hidden_dim=pairwise_hidden_dim,
+        )
+
+    def forward(self, hidden_states, raw_hits, padding_mask=None):
+        batch_size, num_hits, _ = hidden_states.shape
+        neighbor_indices, neighbor_mask = self.build_neighborhood_indices(
+            raw_hits=raw_hits,
+            padding_mask=padding_mask,
+        )
+        query_valid = self._get_query_valid_mask(
+            batch_size=batch_size,
+            num_hits=num_hits,
+            padding_mask=padding_mask,
+            device=hidden_states.device,
+        )
+
+        query = self._project_heads(self.q_proj(hidden_states))
+        key = self._project_heads(self.k_proj(hidden_states))
+        value = self._project_heads(self.v_proj(hidden_states))
+
+        gathered_key = gather_token_neighbors(key, neighbor_indices)
+        gathered_value = gather_token_neighbors(value, neighbor_indices)
+
+        logits = (
+            torch.sum(query.unsqueeze(-2) * gathered_key, dim=-1)
+            / math.sqrt(self.head_dim)
+        )
+        logits = logits + self.pairwise_bias(raw_hits, neighbor_indices)
+
+        attention_mask = neighbor_mask.unsqueeze(1)
+        logits = logits.masked_fill(~attention_mask, -1e9)
+        invalid_queries = ~neighbor_mask.any(dim=-1)
+        logits = logits.masked_fill(invalid_queries.unsqueeze(1).unsqueeze(-1), 0.0)
+
+        attention_weights = torch.softmax(logits, dim=-1)
+        attention_weights = attention_weights * attention_mask
+        attention_weights = self.attn_dropout(attention_weights)
+        attention_weights = attention_weights / attention_weights.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=1e-6)
+
+        context = torch.sum(attention_weights.unsqueeze(-1) * gathered_value, dim=-2)
+        context = context.permute(0, 2, 1, 3).reshape(batch_size, num_hits, -1)
+        context = self.out_proj(context)
+        return context * query_valid.unsqueeze(-1)
+
+    def _project_heads(self, tensor):
+        batch_size, num_hits, _ = tensor.shape
+        return tensor.view(
+            batch_size,
+            num_hits,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 2, 1, 3)
+
+    def build_neighborhood_indices(self, raw_hits, padding_mask=None):
+        batch_size, num_hits, _ = raw_hits.shape
+        device = raw_hits.device
+
+        time_indices, time_mask = self._build_time_window_indices(
+            batch_size=batch_size,
+            num_hits=num_hits,
+            device=device,
+        )
+        spatial_indices, spatial_mask = self._build_spatial_knn_indices(
+            raw_hits=raw_hits,
+            padding_mask=padding_mask,
+        )
+
+        neighbor_indices = torch.cat([time_indices, spatial_indices], dim=-1)
+        neighbor_mask = torch.cat([time_mask, spatial_mask], dim=-1)
+
+        if padding_mask is None:
+            return neighbor_indices, neighbor_mask
+
+        query_valid = (~padding_mask).unsqueeze(-1)
+        key_valid = (~padding_mask).gather(
+            1,
+            neighbor_indices.reshape(batch_size, -1),
+        ).reshape_as(neighbor_indices)
+        neighbor_mask = neighbor_mask & query_valid & key_valid
+        return neighbor_indices, neighbor_mask
+
+    def _build_time_window_indices(self, batch_size, num_hits, device):
+        offsets = torch.arange(
+            -self.time_neighbors,
+            self.time_neighbors + 1,
+            device=device,
+        )
+        centers = torch.arange(num_hits, device=device).view(1, num_hits, 1)
+        window_indices = centers + offsets.view(1, 1, -1)
+        window_mask = (window_indices >= 0) & (window_indices < num_hits)
+        window_indices = window_indices.clamp(0, num_hits - 1).expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        window_mask = window_mask.expand(batch_size, -1, -1)
+        return window_indices, window_mask
+
+    def _build_spatial_knn_indices(self, raw_hits, padding_mask=None):
+        batch_size, num_hits, _ = raw_hits.shape
+        device = raw_hits.device
+        k_neighbors = min(self.spatial_neighbors, num_hits)
+
+        if k_neighbors == 0:
+            empty_indices = torch.empty(
+                batch_size,
+                num_hits,
+                0,
+                dtype=torch.long,
+                device=device,
+            )
+            empty_mask = torch.empty(
+                batch_size,
+                num_hits,
+                0,
+                dtype=torch.bool,
+                device=device,
+            )
+            return empty_indices, empty_mask
+
+        positions = raw_hits[..., 1:4]
+        all_indices = []
+
+        for start in range(0, num_hits, self.spatial_chunk_size):
+            end = min(start + self.spatial_chunk_size, num_hits)
+            query_positions = positions[:, start:end]
+            distances = torch.cdist(query_positions, positions)
+
+            if padding_mask is not None:
+                invalid_keys = padding_mask.unsqueeze(1).expand(-1, end - start, -1)
+                distances = distances.masked_fill(invalid_keys, float("inf"))
+
+            neighbor_indices = torch.topk(
+                distances,
+                k=k_neighbors,
+                largest=False,
+                dim=-1,
+            ).indices
+            all_indices.append(neighbor_indices)
+
+        spatial_indices = torch.cat(all_indices, dim=1)
+        spatial_mask = torch.ones_like(spatial_indices, dtype=torch.bool, device=device)
+        return spatial_indices, spatial_mask
+
+    def _get_query_valid_mask(self, batch_size, num_hits, padding_mask, device):
+        if padding_mask is None:
+            return torch.ones(batch_size, num_hits, dtype=torch.bool, device=device)
+        return ~padding_mask
 
 
 class MaskedAttentionPooling(nn.Module):
@@ -117,41 +376,37 @@ class MaskedAttentionPooling(nn.Module):
         if padding_mask is not None:
             weights = weights.masked_fill(padding_mask, 0.0)
 
-        # Renormalize after masking so only valid hits contribute to the event embedding.
         weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
         return torch.sum(memory * weights.unsqueeze(-1), dim=1)
 
 
 class PairwiseAttentionBias(nn.Module):
-    def __init__(self, num_heads, hidden_dim, time_neighbors=32, spatial_neighbors=32):
+    def __init__(self, num_heads, hidden_dim):
         super().__init__()
-        self.num_heads = num_heads
-        self.time_neighbors = time_neighbors
-        self.spatial_neighbors = spatial_neighbors
         self.bias_mlp = nn.Sequential(
             nn.Linear(8, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_heads),
         )
 
-    def forward(self, raw_hits, padding_mask=None):
-        times = raw_hits[..., 0]
-        positions = raw_hits[..., 1:4]
-        directions = raw_hits[..., 4:7]
+    def forward(self, raw_hits, neighbor_indices):
+        neighbor_hits = gather_hit_neighbors(raw_hits, neighbor_indices)
 
-        # Build physics-motivated pair features for each hit pair.
-        delta_t = times.unsqueeze(2) - times.unsqueeze(1)
-        delta_pos = positions.unsqueeze(2) - positions.unsqueeze(1)
+        source_times = raw_hits[..., 0].unsqueeze(-1)
+        target_times = neighbor_hits[..., 0]
+        source_positions = raw_hits[..., 1:4].unsqueeze(-2)
+        target_positions = neighbor_hits[..., 1:4]
+        source_directions = raw_hits[..., 4:7].unsqueeze(-2)
+        target_directions = neighbor_hits[..., 4:7]
+
+        delta_t = source_times - target_times
+        delta_pos = source_positions - target_positions
         distance = torch.linalg.norm(delta_pos, dim=-1)
 
         safe_distance = distance.unsqueeze(-1).clamp(min=1e-6)
         direction_to_neighbor = delta_pos / safe_distance
-        orientation_source = (
-            directions.unsqueeze(2) * direction_to_neighbor
-        ).sum(dim=-1)
-        orientation_target = (
-            directions.unsqueeze(1) * -direction_to_neighbor
-        ).sum(dim=-1)
+        orientation_source = (source_directions * direction_to_neighbor).sum(dim=-1)
+        orientation_target = (target_directions * -direction_to_neighbor).sum(dim=-1)
 
         pair_features = torch.stack(
             [
@@ -166,65 +421,7 @@ class PairwiseAttentionBias(nn.Module):
             ],
             dim=-1,
         )
-        attention_bias = self.bias_mlp(pair_features).permute(0, 3, 1, 2)
-
-        # Keep attention local in time and space instead of fully dense O(N^2) connectivity.
-        allowed_pairs = self.build_sparse_attention_mask(
-            delta_t=delta_t,
-            distance=distance,
-            padding_mask=padding_mask,
-        )
-        attention_bias = attention_bias.masked_fill(
-            ~allowed_pairs.unsqueeze(1),
-            torch.finfo(attention_bias.dtype).min,
-        )
-
-        batch_size, _, num_hits, _ = attention_bias.shape
-        return attention_bias.reshape(batch_size * self.num_heads, num_hits, num_hits)
-
-    def build_sparse_attention_mask(self, delta_t, distance, padding_mask=None):
-        batch_size, num_hits, _ = delta_t.shape
-        device = delta_t.device
-
-        time_rank = delta_t.abs()
-        distance_rank = distance
-
-        time_k = min(self.time_neighbors, num_hits)
-        spatial_k = min(self.spatial_neighbors, num_hits)
-
-        time_indices = torch.topk(
-            time_rank,
-            k=time_k,
-            largest=False,
-            dim=-1,
-        ).indices
-        spatial_indices = torch.topk(
-            distance_rank,
-            k=spatial_k,
-            largest=False,
-            dim=-1,
-        ).indices
-
-        allowed_time = torch.zeros(
-            batch_size,
-            num_hits,
-            num_hits,
-            dtype=torch.bool,
-            device=device,
-        )
-        allowed_space = torch.zeros_like(allowed_time)
-        allowed_time.scatter_(-1, time_indices, True)
-        allowed_space.scatter_(-1, spatial_indices, True)
-
-        allowed_pairs = allowed_time | allowed_space
-        if padding_mask is not None:
-            # Padded hits cannot be attended to as keys.
-            valid_keys = (~padding_mask).unsqueeze(1)
-            allowed_pairs = allowed_pairs & valid_keys
-
-        # Always allow self-attention so every hit retains a valid path through the layer.
-        diagonal = torch.eye(num_hits, dtype=torch.bool, device=device).unsqueeze(0)
-        return allowed_pairs | diagonal
+        return self.bias_mlp(pair_features).permute(0, 3, 1, 2)
 
 
 class PositionalEncoding(nn.Module):
@@ -244,6 +441,5 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        # `x` is batch-first: [batch, hits, dim].
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)

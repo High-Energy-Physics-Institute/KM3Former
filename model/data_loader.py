@@ -88,24 +88,27 @@ class KM3Loader(Dataset):
         hits, _, _, _, _, _ = self._ensure_loaded()
         return len(hits)
 
+    @property
+    def has_rec_labels(self):
+        return any(name == "rec_labels" for name, _ in self._tensor_specs)
+
+    @property
+    def has_energy_labels(self):
+        return any(name == "energy_labels" for name, _ in self._tensor_specs)
+
     def __getitem__(self, idx):
         hits, raw_hits, padding_mask, labels, rec_labels, energy_labels = (
             self._ensure_loaded()
         )
-        sample = (
-            hits[idx],
-            raw_hits[idx],
-            padding_mask[idx],
-            labels[idx],
-        )
-        if rec_labels is None:
-            if energy_labels is None:
-                return sample
-            # When no reconstructed labels exist, energy is the only optional trailing field.
-            return sample + (energy_labels[idx],)
+        sample = {
+            "hits": hits[idx],
+            "raw_hits": raw_hits[idx],
+            "padding_mask": padding_mask[idx],
+            "muons": labels[idx],
+        }
+        if rec_labels is not None:
+            sample["rec_muons"] = rec_labels[idx]
+        if energy_labels is not None:
+            sample["energy"] = energy_labels[idx]
 
-        if energy_labels is None:
-            return sample + (rec_labels[idx],)
-
-        # The supervised training path expects reconstructed direction before energy.
-        return sample + (rec_labels[idx], energy_labels[idx])
+        return sample

@@ -2,22 +2,6 @@ import torch
 import torch.nn.functional as F
 
 
-def unpack_supervised_batch(batch):
-    # The current training loop is direction-supervised, with optional future energy labels.
-    if len(batch) == 5:
-        hits, raw_hits, padding_mask, muons, rec_muons = batch
-        return hits, raw_hits, padding_mask, muons, rec_muons, None
-
-    if len(batch) == 6:
-        hits, raw_hits, padding_mask, muons, rec_muons, energy_labels = batch
-        return hits, raw_hits, padding_mask, muons, rec_muons, energy_labels
-
-    raise ValueError(
-        "Expected supervised batches with 5 or 6 tensors, "
-        f"received {len(batch)} entries."
-    )
-
-
 def cosine_direction_loss(prediction, target):
     prediction = F.normalize(prediction, dim=-1)
     target = F.normalize(target, dim=-1)
@@ -51,32 +35,41 @@ def move_batch_to_device(*tensors, device):
     return tuple(tensor.to(device, non_blocking=non_blocking) for tensor in tensors)
 
 
+def move_batch_dict_to_device(batch, device):
+    return {
+        key: tensor.to(device, non_blocking=device.type == "cuda")
+        for key, tensor in batch.items()
+    }
+
+
 @torch.no_grad()
-def evaluate_model(model, data_loader, device):
+def evaluate_model(model, data_loader, device, quality_supervised):
     model.eval()
     total_loss = 0.0
     total_angle = 0.0
     total_examples = 0
 
     for batch in data_loader:
-        hits, raw_hits, padding_mask, muons, rec_muons, energy_labels = (
-            unpack_supervised_batch(batch)
-        )
-        tensors_to_move = [hits, raw_hits, padding_mask, muons, rec_muons]
-        if energy_labels is not None:
-            tensors_to_move.append(energy_labels)
+        batch = move_batch_dict_to_device(batch, device=device)
+        hits = batch["hits"]
+        raw_hits = batch["raw_hits"]
+        padding_mask = batch["padding_mask"]
+        muons = batch["muons"]
 
-        moved_tensors = move_batch_to_device(*tensors_to_move, device=device)
-        # Ignore optional energy labels for now; they are only carried through for future heads.
-        hits, raw_hits, padding_mask, muons, rec_muons = moved_tensors[:5]
-
-        prediction, quality = model(
+        model_output = model(
             hits,
             raw_hits=raw_hits,
             padding_mask=padding_mask,
-            return_quality=True,
+            return_quality=quality_supervised,
         )
-        quality_target = reconstruction_quality_target(rec_muons, muons)
+        if quality_supervised:
+            prediction, quality = model_output
+        else:
+            prediction = model_output
+            quality = None
+        quality_target = None
+        if quality_supervised:
+            quality_target = reconstruction_quality_target(batch["rec_muons"], muons)
         batch_size = hits.size(0)
 
         total_loss += combined_loss(
