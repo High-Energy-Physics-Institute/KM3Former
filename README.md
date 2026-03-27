@@ -219,6 +219,7 @@ Options:
 - `--config`
 - `--data-path`
 - `--model-path`
+- `--model-path`
 
 Default training config lives in [train.default.json](/Users/djaz89/projects/KM3Former/configs/train.default.json):
 

@@ -17,7 +17,7 @@ from eval import (
 from km3former import KM3Former
 from scheduler import create_optimizer_and_scheduler
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 DEFAULT_RESOLVED_CONFIG_PATH = "resolved_train_config.json"
 
@@ -176,104 +176,142 @@ def train_model(resolved_config):
     best_val_loss = float("inf")
     model.train()
 
-    for epoch in tqdm(range(epochs), desc="Epochs"):
-        running_loss = 0.0
-        running_metric = 0.0
+    epoch_progress = tqdm(
+        range(epochs),
+        desc="Epochs",
+        position=0,
+        leave=True,
+        dynamic_ncols=True,
+        mininterval=0.5,
+    )
+    try:
+        for epoch in epoch_progress:
+            running_loss = 0.0
+            running_metric = 0.0
+            total_batches = len(train_loader)
 
-        for batch_idx, batch in enumerate(
-            tqdm(train_loader, desc="Training", leave=False)
-        ):
-            batch = move_batch_dict_to_device(batch, device=device)
-            hits = batch["hits"]
-            raw_hits = batch["raw_hits"]
-            padding_mask = batch["padding_mask"]
-            target = batch["target"]
-
-            optimizer.zero_grad()
-            model_output = model(
-                hits,
-                raw_hits=raw_hits,
-                padding_mask=padding_mask,
-                return_quality=quality_supervised,
+            batch_progress = tqdm(
+                train_loader,
+                desc=f"Train {epoch + 1}/{epochs}",
+                total=total_batches,
+                position=1,
+                leave=False,
+                dynamic_ncols=True,
+                mininterval=0.5,
             )
-            if quality_supervised:
-                prediction, quality = model_output
-            else:
-                prediction = model_output
-                quality = None
-            quality_target = None
-            if quality_supervised:
-                quality_target = reconstruction_quality_target(batch["rec_muons"], target)
-            loss = compute_task_loss(
-                prediction,
-                target,
+            try:
+                for batch_idx, batch in enumerate(batch_progress, start=1):
+                    batch = move_batch_dict_to_device(batch, device=device)
+                    hits = batch["hits"]
+                    raw_hits = batch["raw_hits"]
+                    padding_mask = batch["padding_mask"]
+                    target = batch["target"]
+
+                    optimizer.zero_grad()
+                    model_output = model(
+                        hits,
+                        raw_hits=raw_hits,
+                        padding_mask=padding_mask,
+                        return_quality=quality_supervised,
+                    )
+                    if quality_supervised:
+                        prediction, quality = model_output
+                    else:
+                        prediction = model_output
+                        quality = None
+                    quality_target = None
+                    if quality_supervised:
+                        quality_target = reconstruction_quality_target(
+                            batch["rec_muons"],
+                            target,
+                        )
+                    loss = compute_task_loss(
+                        prediction,
+                        target,
+                        task_settings=task_settings,
+                        quality_prediction=quality,
+                        quality_target=quality_target,
+                    )
+                    metric_value = compute_task_metric(
+                        prediction,
+                        target,
+                        task_settings=task_settings,
+                    )
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+
+                    running_loss += loss.item()
+                    running_metric += metric_value.item()
+
+                    global_step = epoch * total_batches + (batch_idx - 1)
+                    writer.add_scalar("Loss/Train_Batch", loss.item(), global_step)
+                    writer.add_scalar(
+                        f"{task_settings['metric_label']}/Train_Batch",
+                        metric_value.item(),
+                        global_step,
+                    )
+
+                    batch_progress.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        metric=f"{metric_value.item():.4f}",
+                        lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                    )
+            finally:
+                batch_progress.close()
+
+            average_train_loss = running_loss / max(total_batches, 1)
+            average_train_metric = running_metric / max(total_batches, 1)
+            val_metrics = evaluate_model(
+                model,
+                val_loader,
+                device=device,
                 task_settings=task_settings,
-                quality_prediction=quality,
-                quality_target=quality_target,
+                quality_supervised=quality_supervised,
             )
-            metric_value = compute_task_metric(
-                prediction,
-                target,
-                task_settings=task_settings,
-            )
+            current_lr = lr_scheduler.get_last_lr()[0]
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            lr_scheduler.step()
-
-            running_loss += loss.item()
-            running_metric += metric_value.item()
-
-            global_step = epoch * len(train_loader) + batch_idx
-            writer.add_scalar("Loss/Train_Batch", loss.item(), global_step)
+            writer.add_scalar("Loss/Train_Epoch", average_train_loss, epoch)
             writer.add_scalar(
-                f"{task_settings['metric_label']}/Train_Batch",
-                metric_value.item(),
-                global_step,
+                f"{task_settings['metric_label']}/Train_Epoch",
+                average_train_metric,
+                epoch,
+            )
+            writer.add_scalar("Loss/Val_Epoch", val_metrics["loss"], epoch)
+            writer.add_scalar(
+                f"{task_settings['metric_label']}/Val_Epoch",
+                val_metrics[task_settings["metric_name"]],
+                epoch,
+            )
+            writer.add_scalar("Learning_Rate", current_lr, epoch)
+
+            epoch_progress.set_postfix(
+                train_loss=f"{average_train_loss:.4f}",
+                train_metric=f"{average_train_metric:.4f}",
+                val_loss=f"{val_metrics['loss']:.4f}",
+                val_metric=f"{val_metrics[task_settings['metric_name']]:.4f}",
             )
 
-        average_train_loss = running_loss / max(len(train_loader), 1)
-        average_train_metric = running_metric / max(len(train_loader), 1)
-        val_metrics = evaluate_model(
-            model,
-            val_loader,
-            device=device,
-            task_settings=task_settings,
-            quality_supervised=quality_supervised,
-        )
-        current_lr = lr_scheduler.get_last_lr()[0]
+            checkpoint = {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": lr_scheduler.state_dict(),
+                "val_loss": val_metrics["loss"],
+                "resolved_config": resolved_config,
+                "quality_supervised": quality_supervised,
+                "task": task_settings["task"],
+                "target_kind": task_settings["target_kind"],
+            }
+            torch.save(checkpoint, f"{model_path}/model_epoch_{epoch + 1}.pth")
 
-        writer.add_scalar("Loss/Train_Epoch", average_train_loss, epoch)
-        writer.add_scalar(
-            f"{task_settings['metric_label']}/Train_Epoch",
-            average_train_metric,
-            epoch,
-        )
-        writer.add_scalar("Loss/Val_Epoch", val_metrics["loss"], epoch)
-        writer.add_scalar(
-            f"{task_settings['metric_label']}/Val_Epoch",
-            val_metrics[task_settings["metric_name"]],
-            epoch,
-        )
-        writer.add_scalar("Learning_Rate", current_lr, epoch)
-
-        checkpoint = {
-            "epoch": epoch + 1,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": lr_scheduler.state_dict(),
-            "val_loss": val_metrics["loss"],
-            "resolved_config": resolved_config,
-            "quality_supervised": quality_supervised,
-            "task": task_settings["task"],
-            "target_kind": task_settings["target_kind"],
-        }
-        torch.save(checkpoint, f"{model_path}/model_epoch_{epoch + 1}.pth")
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            torch.save(checkpoint, f"{model_path}/best_model.pth")
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                torch.save(checkpoint, f"{model_path}/best_model.pth")
+    finally:
+        epoch_progress.close()
 
     best_checkpoint = torch.load(f"{model_path}/best_model.pth", map_location=device)
     model.load_state_dict(best_checkpoint["model_state_dict"])
