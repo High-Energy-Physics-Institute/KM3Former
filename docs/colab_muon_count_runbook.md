@@ -1,6 +1,6 @@
 # Colab Muon-Count Runbook
 
-This runbook is for the fast ablation wave on Colab GPU using ephemeral `/content`.
+This runbook follows the checked-in `KM3Former.ipynb` notebook flow for Colab GPU runs in ephemeral `/content`.
 
 ## 1. Start The Runtime
 
@@ -9,50 +9,37 @@ This runbook is for the fast ablation wave on Colab GPU using ephemeral `/conten
 3. Work in `/content`.
 4. Download every finished run before the session ends.
 
-## 2. Upload The Repo And Dataset
+## 2. Clone The Repo
 
-At the start of the session, upload:
+The notebook clones the `muon-count` branch directly into `/content/KM3Former`.
 
-- `KM3Former.zip`
-- `muon_data_7224_7247.h5`
+```python
+import os
+if not os.path.exists('/content/KM3Former'):
+    !git clone -b muon-count https://github.com/High-Energy-Physics-Institute/KM3Former.git KM3Former
+%cd /content/KM3Former
+```
 
-Notebook cell:
+## 3. Install The Notebook Dependencies
+
+The notebook uses `uv pip install --system` instead of `uv sync`.
+
+```python
+!uv pip install km3io awkward tqdm pandas joblib --system
+
+import sys
+import os
+repo_path = '/content/KM3Former'
+if repo_path not in sys.path:
+    sys.path.append(repo_path)
+```
+
+If the cloned branch does not already contain `data/muon_data_7224_7247.h5`, upload it manually and move it into `data/`:
 
 ```python
 from google.colab import files
 uploaded = files.upload()
 ```
-
-## 3. Unpack And Install Dependencies
-
-```bash
-!apt-get -qq update
-!apt-get -qq install -y unzip
-!unzip -q KM3Former.zip -d /content
-```
-
-If the zip expands to `/content/KM3Former`:
-
-```bash
-%cd /content/KM3Former
-```
-
-Install `uv` and sync the environment:
-
-```bash
-!curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-```python
-import os
-os.environ["PATH"] = "/root/.local/bin:" + os.environ["PATH"]
-```
-
-```bash
-!uv sync
-```
-
-Move the uploaded HDF5 file into the repo data directory:
 
 ```bash
 !mkdir -p /content/KM3Former/data
@@ -61,15 +48,22 @@ Move the uploaded HDF5 file into the repo data directory:
 
 Sanity checks:
 
-```bash
+```python
+import torch
 !nvidia-smi
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"Device: {torch.cuda.get_device_name(0)}")
+```
+
+```bash
 !ls -lh data/muon_data_7224_7247.h5
 ```
 
 ## 4. Preprocess Once Per Session
 
 ```bash
-!uv run python pre-porcessing/pre_process.py \
+!python pre-porcessing/pre_process.py \
   --source-format hdf5 \
   --task muon_count \
   --data-path ./data \
@@ -88,10 +82,22 @@ Validate the outputs:
 
 ## 5. Run One Experiment At A Time
 
-Training pattern:
+Before training, the notebook enables expandable CUDA segments:
+
+```python
+%env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+Notebook baseline training command:
 
 ```bash
-!uv run python model/train.py \
+!python model/train.py --config configs/train.muon_count.colab.json
+```
+
+General experiment pattern:
+
+```bash
+!python model/train.py \
   --config configs/experiments/EXP_NAME.json \
   --model-path ./runs/EXP_NAME
 ```
@@ -99,11 +105,46 @@ Training pattern:
 Inference pattern:
 
 ```bash
-!uv run python model/infer.py \
+!python model/infer.py \
   --checkpoint-path ./runs/EXP_NAME/best_model.pth \
   --output-path ./runs/EXP_NAME/test_predictions.pt \
   --split test \
   --data-path ./data
+```
+
+The notebook baseline inference command is:
+
+```bash
+!python model/infer.py \
+  --checkpoint-path ./runs/muon_count_colab/best_model.pth \
+  --split test \
+  --data-path ./data \
+  --output-path ./runs/muon_count_colab/test_predictions.pt
+```
+
+Quick notebook-style checks after inference:
+
+```python
+import torch
+p = torch.load('runs/EXP_NAME/test_predictions.pt', map_location='cpu')
+print({
+    k: (tuple(v.shape) if hasattr(v, 'shape') else v)
+    for k, v in p.items()
+    if k in ['task', 'target_kind', 'predictions', 'probabilities', 'predicted_classes', 'predicted_labels']
+})
+```
+
+```python
+y = torch.load('data/test_targets.pt', map_location='cpu')
+pred = p['predicted_classes']
+print({'test_accuracy': float((pred == y).float().mean())})
+```
+
+If you want the richer saved evaluation summary from the updated code, inspect:
+
+```python
+q = torch.load('runs/EXP_NAME/test_predictions.pt', map_location='cpu')
+print(q.get('summary') or q.get('metrics'))
 ```
 
 Collect preprocessing artifacts into the run directory:
@@ -121,7 +162,13 @@ Add a short notes file:
 
 ## 6. Archive Each Finished Run
 
-Because `/content` is ephemeral, zip every run immediately:
+The notebook archives the default Colab run like this:
+
+```bash
+!zip -r /content/KM3Former/runs/muon_count_colab.zip /content/KM3Former/runs/muon_count_colab
+```
+
+For named ablation runs, zip every run immediately:
 
 ```bash
 !cd runs && zip -r EXP_NAME.zip EXP_NAME

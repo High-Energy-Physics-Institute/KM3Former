@@ -438,7 +438,7 @@ The fast ablation configs live under:
 - [exp_006_no_posenc.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_006_no_posenc.json)
 - [exp_007_pooling_upgrade.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_007_pooling_upgrade.json)
 
-The detailed ephemeral Colab workflow is documented in [colab_muon_count_runbook.md](/Users/djaz89/projects/KM3Former/docs/colab_muon_count_runbook.md).
+The detailed ephemeral Colab workflow is documented in [colab_muon_count_runbook.md](/Users/djaz89/projects/KM3Former/docs/colab_muon_count_runbook.md) and is aligned with [KM3Former.ipynb](/Users/djaz89/projects/KM3Former/KM3Former.ipynb).
 
 ## Next Useful Experiments
 
