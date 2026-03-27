@@ -1,0 +1,23 @@
+{
+  "paths": {
+    "data_path": "./data",
+    "model_path": "./runs/muon_count_colab"
+  },
+  "model": {
+    "model_dim": 128,
+    "num_heads": 4,
+    "num_encoder_layers": 4,
+    "dim_feedforward": 256,
+    "dropout": 0.1,
+    "pairwise_neighbors": 16
+  },
+  "training": {
+    "batch_size": 64,
+    "learning_rate": 0.0008,
+    "epochs": 10
+  },
+  "loader": {
+    "train_max_workers": 2,
+    "eval_max_workers": 2
+  }
+}
