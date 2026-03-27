@@ -107,6 +107,53 @@ Each experiment directory should collect at least:
 
 This makes the outputs reusable for the next experiments and keeps a clear history of model and configuration changes.
 
+## Experiment Log Requirement
+
+In addition to saving each run directory, every finished experiment should be logged to a root-level Markdown file:
+
+- `results.md`
+
+This log should be laconic. Each experiment record should be at most 2 to 3 sentences.
+
+Each record should include the most important facts only:
+
+- run name or run path
+- short git commit hash
+- how much data was used
+- what was changed or kept as baseline
+- best validation loss
+- test accuracy when available
+- confusion matrix when available
+- status such as `keep`, `discard`, or `crash`
+
+Recommended structure:
+
+```markdown
+## exp_001_baseline
+
+Sentence 1: what data was used, which config or model setup was used, and whether this is a baseline or a modified run.
+Sentence 2: the key result numbers such as best validation loss, test accuracy, and confusion matrix.
+Sentence 3 if needed: one short interpretation or status note such as keep, discard, or crash.
+```
+
+Crash convention:
+
+- if a run crashes before producing a usable checkpoint, say so explicitly
+- if a metric is unavailable, say that it was not recorded instead of inventing a placeholder number
+
+When an experiment is complete:
+
+1. save the run directory under a unique `runs/.../exp_...` path
+2. copy `metadata.json` and `hits_stats.pt` into that run directory
+3. record the best validation loss from training
+4. run inference and capture the confusion matrix when possible
+5. append a short Markdown entry to `results.md`
+
+This gives the project two layers of experiment tracking:
+
+- full artifacts in each run directory
+- a compact narrative log in `results.md` for quick comparison
+
 ## 1. Environment Setup
 
 From the repository root:
@@ -266,7 +313,8 @@ For every new experiment:
 1. keep preprocessing in `data/` unless the dataset itself changes
 2. launch training with a new `--model-path`
 3. save inference output inside that same new run directory
-4. compare the new run against earlier runs using the saved config, checkpoint, TensorBoard logs, and prediction outputs
+4. append the experiment summary to `results.md`
+5. compare the new run against earlier runs using the saved config, checkpoint, TensorBoard logs, predictions, and Markdown log
 
 Examples:
 
@@ -305,4 +353,5 @@ The program should no longer describe nonexistent filenames or a generic templat
 2. train KM3Former for `muon_count`
 3. save each experiment under its own run directory
 4. collect checkpoint, config, metadata snapshot, and predictions for later comparison
-5. infer on the test split and keep the predictions with the same experiment artifacts
+5. append a short summary entry to `results.md`
+6. infer on the test split and keep the predictions with the same experiment artifacts
