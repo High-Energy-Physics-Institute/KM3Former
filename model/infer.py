@@ -4,6 +4,7 @@ from pathlib import Path
 import click
 import torch
 from config import get_model_init_kwargs, resolve_train_config
+from eval import resolve_task_settings
 from km3former import KM3Former
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -93,9 +94,11 @@ def build_inference_loader(hits, raw_hits, padding_mask, batch_size):
 
 
 @torch.no_grad()
-def predict_batches(model, data_loader, device, quality_supervised):
+def predict_batches(model, data_loader, device, quality_supervised, task_settings):
     predictions = []
     quality_scores = [] if quality_supervised else None
+    class_predictions = [] if task_settings["target_kind"] == "multiclass" else None
+    probabilities = [] if task_settings["target_kind"] == "multiclass" else None
 
     for hits, raw_hits, padding_mask in data_loader:
         hits = hits.to(device)
@@ -112,13 +115,21 @@ def predict_batches(model, data_loader, device, quality_supervised):
             batch_predictions, batch_quality = model_output
         else:
             batch_predictions = model_output
+            batch_quality = None
         predictions.append(batch_predictions.cpu())
         if quality_supervised:
             quality_scores.append(batch_quality.cpu())
+        if task_settings["target_kind"] == "multiclass":
+            batch_probabilities = torch.softmax(batch_predictions, dim=-1)
+            probabilities.append(batch_probabilities.cpu())
+            class_predictions.append(torch.argmax(batch_predictions, dim=-1).cpu())
 
     output = {"predictions": torch.cat(predictions, dim=0)}
     if quality_supervised:
         output["quality"] = torch.cat(quality_scores, dim=0)
+    if task_settings["target_kind"] == "multiclass":
+        output["probabilities"] = torch.cat(probabilities, dim=0)
+        output["predicted_classes"] = torch.cat(class_predictions, dim=0)
     return output
 
 
@@ -163,6 +174,7 @@ def run_inference(
             stats_path=stats_path,
         )
     )
+    task_settings = resolve_task_settings(metadata)
     hits, raw_hits, padding_mask = load_inference_tensors(input_paths=input_paths)
 
     resolved_device = torch.device(
@@ -171,7 +183,10 @@ def run_inference(
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     checkpoint = torch.load(checkpoint_path, map_location=resolved_device)
-    quality_supervised = checkpoint.get("quality_supervised", True)
+    quality_supervised = checkpoint.get(
+        "quality_supervised",
+        task_settings["supports_quality"],
+    ) and task_settings["supports_quality"]
     model, resolved_config = build_model_from_checkpoint(
         metadata=metadata,
         checkpoint=checkpoint,
@@ -188,6 +203,7 @@ def run_inference(
         data_loader=data_loader,
         device=resolved_device,
         quality_supervised=quality_supervised,
+        task_settings=task_settings,
     )
 
     payload = {
@@ -197,6 +213,8 @@ def run_inference(
         "stats_path": resolved_stats_path,
         "input_paths": input_paths,
         "resolved_config": resolved_config,
+        "task": task_settings["task"],
+        "target_kind": task_settings["target_kind"],
         "supports_quality": quality_supervised,
         "feature_mean_shape": list(feature_stats["mean"].shape),
         "feature_std_shape": list(feature_stats["std"].shape),
@@ -204,6 +222,14 @@ def run_inference(
     }
     if quality_supervised:
         payload["quality"] = predictions["quality"]
+    if task_settings["target_kind"] == "multiclass":
+        payload["probabilities"] = predictions["probabilities"]
+        payload["predicted_classes"] = predictions["predicted_classes"]
+        if "class_values" in metadata:
+            class_values = metadata["class_values"]
+            payload["predicted_labels"] = torch.tensor(
+                [class_values[index] for index in predictions["predicted_classes"].tolist()]
+            )
     save_inference_output(output_path=output_path, payload=payload)
     return payload
 

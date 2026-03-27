@@ -7,11 +7,12 @@ import torch
 from config import get_model_init_kwargs, resolve_train_config, save_json_file
 from data_loader import KM3Loader
 from eval import (
-    angular_error_degrees,
-    combined_loss,
+    compute_task_loss,
+    compute_task_metric,
     evaluate_model,
     move_batch_dict_to_device,
     reconstruction_quality_target,
+    resolve_task_settings,
 )
 from km3former import KM3Former
 from scheduler import create_optimizer_and_scheduler
@@ -22,22 +23,32 @@ DEFAULT_RESOLVED_CONFIG_PATH = "resolved_train_config.json"
 
 
 def build_dataset(split_name, data_path, load_strategy="lazy"):
+    target_file = f"{data_path}/{split_name}_targets.pt"
+    legacy_label_file = f"{data_path}/{split_name}_muons.pt"
     rec_label_file = f"{data_path}/{split_name}_muons_rec.pt"
     energy_label_file = f"{data_path}/{split_name}_muons_e.pt"
+    metadata_file = f"{data_path}/metadata.json"
+
     return KM3Loader(
         hits_file=f"{data_path}/{split_name}_hits.pt",
         raw_hits_file=f"{data_path}/{split_name}_hits_raw.pt",
         padding_mask_file=f"{data_path}/{split_name}_padding_mask.pt",
-        label_file=f"{data_path}/{split_name}_muons.pt",
+        target_file=target_file if os.path.exists(target_file) else None,
+        label_file=legacy_label_file if os.path.exists(legacy_label_file) else None,
         rec_label_file=rec_label_file if os.path.exists(rec_label_file) else None,
         energy_label_file=(
             energy_label_file if os.path.exists(energy_label_file) else None
         ),
+        metadata_file=metadata_file if os.path.exists(metadata_file) else None,
         load_strategy=load_strategy,
     )
 
 
-def resolve_quality_supervision(*datasets):
+def resolve_quality_supervision(*datasets, metadata=None):
+    task_settings = resolve_task_settings(metadata or {})
+    if not task_settings["supports_quality"]:
+        return False
+
     availability = [dataset.has_rec_labels for dataset in datasets]
     if any(availability) and not all(availability):
         raise ValueError(
@@ -106,6 +117,7 @@ def train_model(resolved_config):
     eval_max_workers = resolved_config["loader"]["eval_max_workers"]
 
     metadata = load_metadata(data_path=data_path)
+    task_settings = resolve_task_settings(metadata)
 
     os.makedirs(model_path, exist_ok=True)
     # Save the final merged config so each checkpoint directory is self-describing.
@@ -121,6 +133,7 @@ def train_model(resolved_config):
         train_dataset,
         val_dataset,
         test_dataset,
+        metadata=metadata,
     )
 
     train_loader = build_data_loader(
@@ -165,7 +178,7 @@ def train_model(resolved_config):
 
     for epoch in tqdm(range(epochs), desc="Epochs"):
         running_loss = 0.0
-        running_angle = 0.0
+        running_metric = 0.0
 
         for batch_idx, batch in enumerate(
             tqdm(train_loader, desc="Training", leave=False)
@@ -174,7 +187,7 @@ def train_model(resolved_config):
             hits = batch["hits"]
             raw_hits = batch["raw_hits"]
             padding_mask = batch["padding_mask"]
-            muons = batch["muons"]
+            target = batch["target"]
 
             optimizer.zero_grad()
             model_output = model(
@@ -190,14 +203,19 @@ def train_model(resolved_config):
                 quality = None
             quality_target = None
             if quality_supervised:
-                quality_target = reconstruction_quality_target(batch["rec_muons"], muons)
-            loss = combined_loss(
+                quality_target = reconstruction_quality_target(batch["rec_muons"], target)
+            loss = compute_task_loss(
                 prediction,
-                muons,
+                target,
+                task_settings=task_settings,
                 quality_prediction=quality,
                 quality_target=quality_target,
             )
-            angle = angular_error_degrees(prediction, muons)
+            metric_value = compute_task_metric(
+                prediction,
+                target,
+                task_settings=task_settings,
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -205,26 +223,39 @@ def train_model(resolved_config):
             lr_scheduler.step()
 
             running_loss += loss.item()
-            running_angle += angle.item()
+            running_metric += metric_value.item()
 
             global_step = epoch * len(train_loader) + batch_idx
             writer.add_scalar("Loss/Train_Batch", loss.item(), global_step)
-            writer.add_scalar("Angle/Train_Batch", angle.item(), global_step)
+            writer.add_scalar(
+                f"{task_settings['metric_label']}/Train_Batch",
+                metric_value.item(),
+                global_step,
+            )
 
         average_train_loss = running_loss / max(len(train_loader), 1)
-        average_train_angle = running_angle / max(len(train_loader), 1)
+        average_train_metric = running_metric / max(len(train_loader), 1)
         val_metrics = evaluate_model(
             model,
             val_loader,
             device=device,
+            task_settings=task_settings,
             quality_supervised=quality_supervised,
         )
         current_lr = lr_scheduler.get_last_lr()[0]
 
         writer.add_scalar("Loss/Train_Epoch", average_train_loss, epoch)
-        writer.add_scalar("Angle/Train_Epoch", average_train_angle, epoch)
+        writer.add_scalar(
+            f"{task_settings['metric_label']}/Train_Epoch",
+            average_train_metric,
+            epoch,
+        )
         writer.add_scalar("Loss/Val_Epoch", val_metrics["loss"], epoch)
-        writer.add_scalar("Angle/Val_Epoch", val_metrics["angle_deg"], epoch)
+        writer.add_scalar(
+            f"{task_settings['metric_label']}/Val_Epoch",
+            val_metrics[task_settings["metric_name"]],
+            epoch,
+        )
         writer.add_scalar("Learning_Rate", current_lr, epoch)
 
         checkpoint = {
@@ -235,6 +266,8 @@ def train_model(resolved_config):
             "val_loss": val_metrics["loss"],
             "resolved_config": resolved_config,
             "quality_supervised": quality_supervised,
+            "task": task_settings["task"],
+            "target_kind": task_settings["target_kind"],
         }
         torch.save(checkpoint, f"{model_path}/model_epoch_{epoch + 1}.pth")
 
@@ -248,8 +281,15 @@ def train_model(resolved_config):
         model,
         test_loader,
         device=device,
+        task_settings=task_settings,
         quality_supervised=quality_supervised,
     )
+    hparam_metrics = {
+        "hparam/test_loss": test_metrics["loss"],
+        f"hparam/test_{task_settings['metric_name']}": test_metrics[
+            task_settings["metric_name"]
+        ],
+    }
     writer.add_hparams(
         {
             "learning_rate": learning_rate,
@@ -257,10 +297,7 @@ def train_model(resolved_config):
             "pairwise_neighbors": resolved_config["model"]["pairwise_neighbors"],
             "model_dim": resolved_config["model"]["model_dim"],
         },
-        {
-            "hparam/test_loss": test_metrics["loss"],
-            "hparam/test_angle_deg": test_metrics["angle_deg"],
-        },
+        hparam_metrics,
     )
     writer.close()
     return test_metrics

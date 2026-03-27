@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,12 @@ class KM3LoaderTestCase(unittest.TestCase):
     def _write_tensor(self, name, tensor):
         path = self.data_dir / f"{name}.pt"
         torch.save(tensor, path)
+        return path
+
+    def _write_metadata(self, payload):
+        path = self.data_dir / "metadata.json"
+        with open(path, "w", encoding="ascii") as metadata_file:
+            json.dump(payload, metadata_file, indent=2, sort_keys=True)
         return path
 
     def _write_dataset_files(
@@ -85,9 +92,13 @@ class KM3LoaderTestCase(unittest.TestCase):
         dataset = KM3Loader(load_strategy="lazy", **dataset_kwargs)
 
         sample = dataset[0]
-        self.assertEqual(set(sample), {"hits", "raw_hits", "padding_mask", "muons"})
+        self.assertEqual(
+            set(sample),
+            {"hits", "raw_hits", "padding_mask", "target", "muons"},
+        )
         self.assertEqual(sample["hits"].shape, torch.Size([3, 4]))
         self.assertEqual(sample["padding_mask"].dtype, torch.bool)
+        self.assertTrue(torch.equal(sample["target"], sample["muons"]))
 
     def test_mismatched_tensor_lengths_raise_value_error(self):
         dataset_kwargs = self._write_dataset_files(label_length=1)
@@ -104,10 +115,14 @@ class KM3LoaderTestCase(unittest.TestCase):
         loader = DataLoader(dataset, batch_size=2, shuffle=False)
 
         batch = next(iter(loader))
-        self.assertEqual(set(batch), {"hits", "raw_hits", "padding_mask", "muons", "rec_muons"})
+        self.assertEqual(
+            set(batch),
+            {"hits", "raw_hits", "padding_mask", "target", "muons", "rec_muons"},
+        )
         self.assertEqual(batch["hits"].shape, torch.Size([2, 3, 4]))
         self.assertEqual(batch["raw_hits"].shape, torch.Size([2, 3, 4]))
         self.assertEqual(batch["padding_mask"].shape, torch.Size([2, 3]))
+        self.assertEqual(batch["target"].shape, torch.Size([2, 3]))
         self.assertEqual(batch["muons"].shape, torch.Size([2, 3]))
         self.assertEqual(batch["rec_muons"].shape, torch.Size([2, 3]))
         self.assertEqual(batch["padding_mask"].dtype, torch.bool)
@@ -135,10 +150,11 @@ class KM3LoaderTestCase(unittest.TestCase):
         sample = dataset[0]
         self.assertEqual(
             set(sample),
-            {"hits", "raw_hits", "padding_mask", "muons", "rec_muons", "energy"},
+            {"hits", "raw_hits", "padding_mask", "target", "muons", "rec_muons", "energy"},
         )
         self.assertEqual(sample["rec_muons"].shape, torch.Size([3]))
         self.assertEqual(sample["energy"].shape, torch.Size([]))
+        self.assertTrue(torch.equal(sample["target"], sample["muons"]))
 
     def test_loader_without_rec_labels_can_still_return_energy_labels(self):
         dataset_kwargs = self._write_dataset_files(
@@ -150,9 +166,39 @@ class KM3LoaderTestCase(unittest.TestCase):
         sample = dataset[0]
         self.assertEqual(
             set(sample),
-            {"hits", "raw_hits", "padding_mask", "muons", "energy"},
+            {"hits", "raw_hits", "padding_mask", "target", "muons", "energy"},
         )
         self.assertEqual(sample["energy"].shape, torch.Size([]))
+        self.assertTrue(torch.equal(sample["target"], sample["muons"]))
+
+    def test_loader_can_read_generic_target_file_for_count_task(self):
+        hits = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        raw_hits = hits + 10.0
+        padding_mask = torch.tensor(
+            [[False, False, True], [False, True, True]],
+            dtype=torch.bool,
+        )
+        targets = torch.tensor([0, 2], dtype=torch.long)
+
+        dataset = KM3Loader(
+            hits_file=self._write_tensor("hits", hits),
+            raw_hits_file=self._write_tensor("raw_hits", raw_hits),
+            padding_mask_file=self._write_tensor("padding_mask", padding_mask),
+            target_file=self._write_tensor("targets", targets),
+            metadata_file=self._write_metadata(
+                {
+                    "task": "muon_count",
+                    "target_kind": "multiclass",
+                    "target_dim": 3,
+                }
+            ),
+            load_strategy="lazy",
+        )
+
+        sample = dataset[1]
+        self.assertEqual(set(sample), {"hits", "raw_hits", "padding_mask", "target"})
+        self.assertEqual(sample["target"].dtype, torch.long)
+        self.assertEqual(sample["target"].shape, torch.Size([]))
 
     def test_build_data_loader_uses_mac_safe_defaults(self):
         dataset_kwargs = self._write_dataset_files()

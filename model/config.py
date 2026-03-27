@@ -69,6 +69,8 @@ def get_model_init_kwargs(metadata, resolved_config):
     model_config = resolved_config["model"]
     return {
         "input_dim": metadata["input_dim"],
+        "target_dim": metadata.get("target_dim", 3),
+        "target_kind": metadata.get("target_kind", "vector_regression"),
         "model_dim": model_config["model_dim"],
         "num_heads": model_config["num_heads"],
         "num_encoder_layers": model_config["num_encoder_layers"],

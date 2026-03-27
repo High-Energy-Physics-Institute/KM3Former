@@ -1,3 +1,5 @@
+import json
+
 import torch
 from torch.utils.data import Dataset
 
@@ -8,9 +10,11 @@ class KM3Loader(Dataset):
         hits_file,
         raw_hits_file,
         padding_mask_file,
-        label_file,
+        label_file=None,
+        target_file=None,
         rec_label_file=None,
         energy_label_file=None,
+        metadata_file=None,
         load_strategy="lazy",
     ):
         if load_strategy not in {"eager", "lazy"}:
@@ -18,13 +22,21 @@ class KM3Loader(Dataset):
                 "load_strategy must be either 'eager' or 'lazy'. "
                 f"Received: {load_strategy!r}."
             )
+        if label_file is None and target_file is None:
+            raise ValueError("KM3Loader requires either label_file or target_file.")
 
         self.load_strategy = load_strategy
+        self.metadata = None
+        if metadata_file is not None:
+            with open(metadata_file, "r", encoding="ascii") as metadata_handle:
+                self.metadata = json.load(metadata_handle)
+
+        resolved_target_file = target_file or label_file
         self._tensor_specs = [
             ("hits", hits_file),
             ("raw_hits", raw_hits_file),
             ("padding_mask", padding_mask_file),
-            ("labels", label_file),
+            ("targets", resolved_target_file),
         ]
         # Keep optional targets append-only so older datasets still load unchanged.
         if rec_label_file is not None:
@@ -52,7 +64,7 @@ class KM3Loader(Dataset):
             loaded_map["hits"],
             loaded_map["raw_hits"],
             loaded_map["padding_mask"],
-            loaded_map["labels"],
+            loaded_map["targets"],
             loaded_map.get("rec_labels"),
             loaded_map.get("energy_labels"),
         )
@@ -96,16 +108,23 @@ class KM3Loader(Dataset):
     def has_energy_labels(self):
         return any(name == "energy_labels" for name, _ in self._tensor_specs)
 
+    def _should_expose_muons_alias(self, targets):
+        if self.metadata is not None:
+            return self.metadata.get("task") == "direction"
+        return targets.ndim > 1 and targets.shape[-1] == 3
+
     def __getitem__(self, idx):
-        hits, raw_hits, padding_mask, labels, rec_labels, energy_labels = (
+        hits, raw_hits, padding_mask, targets, rec_labels, energy_labels = (
             self._ensure_loaded()
         )
         sample = {
             "hits": hits[idx],
             "raw_hits": raw_hits[idx],
             "padding_mask": padding_mask[idx],
-            "muons": labels[idx],
+            "target": targets[idx],
         }
+        if self._should_expose_muons_alias(targets):
+            sample["muons"] = targets[idx]
         if rec_labels is not None:
             sample["rec_muons"] = rec_labels[idx]
         if energy_labels is not None:

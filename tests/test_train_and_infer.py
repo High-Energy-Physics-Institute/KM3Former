@@ -40,12 +40,18 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         torch.save(tensor, path)
         return path
 
-    def _write_runtime_files(self):
+    def _write_runtime_files(self, metadata_overrides=None):
         metadata = {
+            "task": "direction",
+            "target_kind": "vector_regression",
+            "target_name": "muon_direction",
+            "target_dim": 3,
             "input_dim": 10,
             "max_hits": 4,
             "feature_names": [f"feature_{index}" for index in range(10)],
         }
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         self._write_json("data/metadata.json", metadata)
         self._write_tensor(
             "data/hits_stats.pt",
@@ -109,6 +115,46 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         )
         self.assertEqual(predictions.shape, torch.Size([2, 3]))
         self.assertEqual(quality.shape, torch.Size([2]))
+
+    def test_build_model_supports_multiclass_targets(self):
+        resolved = resolve_train_config(
+            overrides={
+                "paths": {
+                    "data_path": str(self.data_dir),
+                    "model_path": str(self.model_dir),
+                },
+                "model": {
+                    "model_dim": 64,
+                    "num_heads": 4,
+                    "num_encoder_layers": 2,
+                    "dim_feedforward": 128,
+                    "pairwise_neighbors": 8,
+                },
+            }
+        )
+        model = build_model(
+            metadata={
+                "task": "muon_count",
+                "target_kind": "multiclass",
+                "target_dim": 3,
+                "input_dim": 10,
+                "max_hits": 4,
+            },
+            resolved_config=resolved,
+            device=torch.device("cpu"),
+        )
+        predictions = model(
+            torch.randn(2, 4, 10),
+            raw_hits=torch.randn(2, 4, 10),
+            padding_mask=torch.tensor(
+                [[False, False, False, True], [False, False, True, True]],
+                dtype=torch.bool,
+            ),
+            return_quality=True,
+        )
+
+        self.assertIsInstance(predictions, torch.Tensor)
+        self.assertEqual(predictions.shape, torch.Size([2, 3]))
 
     def test_click_train_cli_exposes_help(self):
         result = CliRunner().invoke(train_cli, ["--help"])
@@ -269,6 +315,68 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         self.assertFalse(payload["supports_quality"])
         self.assertNotIn("quality", payload)
 
+    def test_inference_exposes_multiclass_outputs_for_count_task(self):
+        metadata, hits_path, raw_hits_path, padding_mask_path = self._write_runtime_files(
+            metadata_overrides={
+                "task": "muon_count",
+                "target_kind": "multiclass",
+                "target_name": "muon_count",
+                "target_dim": 3,
+                "class_values": [1, 2, 3],
+            }
+        )
+        resolved_config = resolve_train_config(
+            overrides={
+                "paths": {
+                    "data_path": str(self.data_dir),
+                    "model_path": str(self.model_dir),
+                },
+                "model": {
+                    "model_dim": 64,
+                    "num_heads": 4,
+                    "num_encoder_layers": 2,
+                    "dim_feedforward": 128,
+                    "pairwise_neighbors": 8,
+                },
+            }
+        )
+        model = build_model(
+            metadata=metadata,
+            resolved_config=resolved_config,
+            device=torch.device("cpu"),
+        )
+        checkpoint_path = self.workspace / "model" / "count_checkpoint.pth"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "resolved_config": resolved_config,
+                "quality_supervised": False,
+                "task": "muon_count",
+                "target_kind": "multiclass",
+            },
+            checkpoint_path,
+        )
+
+        payload = run_inference(
+            checkpoint_path=str(checkpoint_path),
+            output_path=str(self.workspace / "count_predictions.pt"),
+            data_path=str(self.data_dir),
+            hits_file=str(hits_path),
+            raw_hits_file=str(raw_hits_path),
+            padding_mask_file=str(padding_mask_path),
+            batch_size=1,
+            device="cpu",
+        )
+
+        self.assertEqual(payload["task"], "muon_count")
+        self.assertEqual(payload["target_kind"], "multiclass")
+        self.assertEqual(payload["predictions"].shape, torch.Size([2, 3]))
+        self.assertEqual(payload["probabilities"].shape, torch.Size([2, 3]))
+        self.assertEqual(payload["predicted_classes"].shape, torch.Size([2]))
+        self.assertEqual(payload["predicted_labels"].shape, torch.Size([2]))
+        self.assertFalse(payload["supports_quality"])
+        self.assertNotIn("quality", payload)
+
     def test_resolve_quality_supervision_rejects_mixed_split_capabilities(self):
         class DatasetStub:
             def __init__(self, has_rec_labels):
@@ -283,6 +391,20 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
                 DatasetStub(False),
                 DatasetStub(True),
             )
+
+    def test_resolve_quality_supervision_disables_quality_for_multiclass_tasks(self):
+        class DatasetStub:
+            def __init__(self, has_rec_labels):
+                self.has_rec_labels = has_rec_labels
+
+        self.assertFalse(
+            resolve_quality_supervision(
+                DatasetStub(False),
+                DatasetStub(False),
+                DatasetStub(False),
+                metadata={"task": "muon_count", "target_kind": "multiclass"},
+            )
+        )
 
 
 if __name__ == "__main__":

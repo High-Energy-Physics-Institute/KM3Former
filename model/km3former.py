@@ -60,9 +60,13 @@ class KM3Former(nn.Module):
         max_hits=512,
         pairwise_neighbors=32,
         pairwise_hidden_dim=None,
+        target_dim=3,
+        target_kind="vector_regression",
     ):
         super().__init__()
         self.model_dim = model_dim
+        self.target_dim = target_dim
+        self.target_kind = target_kind
 
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, model_dim),
@@ -90,7 +94,7 @@ class KM3Former(nn.Module):
         )
         self.final_norm = nn.LayerNorm(model_dim)
         self.pooler = MaskedAttentionPooling(model_dim=model_dim)
-        self.fc_out = nn.Linear(model_dim, 3)
+        self.fc_out = nn.Linear(model_dim, target_dim)
         self.quality_head = nn.Linear(model_dim, 1)
 
     def forward(self, src, raw_hits=None, padding_mask=None, return_quality=False):
@@ -120,13 +124,15 @@ class KM3Former(nn.Module):
 
         memory = self.final_norm(memory) * valid_mask
         pooled = self.pooler(memory, padding_mask=padding_mask)
-        direction = F.normalize(self.fc_out(pooled), dim=-1)
+        prediction = self.fc_out(pooled)
+        if self.target_kind == "vector_regression":
+            prediction = F.normalize(prediction, dim=-1)
 
-        if return_quality:
+        if return_quality and self.target_kind == "vector_regression":
             quality = torch.sigmoid(self.quality_head(pooled)).squeeze(-1)
-            return direction, quality
+            return prediction, quality
 
-        return direction
+        return prediction
 
 
 class SparseNeighborhoodEncoderLayer(nn.Module):
