@@ -1,0 +1,16 @@
+{
+  "paths": {
+    "model_path": "./runs/exp_004_pairbias_timecompress"
+  },
+  "model": {
+    "model_dim": 128,
+    "num_encoder_layers": 4,
+    "dim_feedforward": 256,
+    "pairwise_neighbors": 16,
+    "pairwise_time_transform": "signed_log1p",
+    "pairwise_distance_transform": "log1p"
+  },
+  "training": {
+    "batch_size": 32
+  }
+}

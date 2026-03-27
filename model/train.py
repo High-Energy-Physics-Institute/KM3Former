@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 DEFAULT_RESOLVED_CONFIG_PATH = "resolved_train_config.json"
+DEFAULT_METRICS_PATH = "metrics.json"
 
 
 def build_dataset(split_name, data_path, load_strategy="lazy"):
@@ -103,6 +104,41 @@ def get_cli_overrides(data_path=None, model_path=None):
     if model_path is not None:
         overrides.setdefault("paths", {})["model_path"] = model_path
     return overrides
+
+
+def build_prediction_artifact(split_name, evaluation, task_settings, metadata):
+    outputs = evaluation["outputs"]
+    payload = {
+        "split": split_name,
+        "task": task_settings["task"],
+        "target_kind": task_settings["target_kind"],
+        "loss": evaluation["loss"],
+        task_settings["metric_name"]: evaluation[task_settings["metric_name"]],
+        "predictions": outputs["predictions"],
+        "targets": outputs["targets"],
+        "summary": evaluation["summary"],
+    }
+    if "quality" in outputs:
+        payload["quality"] = outputs["quality"]
+    if task_settings["target_kind"] == "multiclass":
+        payload["probabilities"] = outputs["probabilities"]
+        payload["predicted_classes"] = outputs["predicted_classes"]
+        if "class_values" in metadata:
+            class_values = metadata["class_values"]
+            payload["predicted_labels"] = torch.tensor(
+                [class_values[index] for index in outputs["predicted_classes"].tolist()]
+            )
+    return payload
+
+
+def build_metrics_record(evaluation, task_settings):
+    metrics = {
+        "loss": evaluation["loss"],
+        task_settings["metric_name"]: evaluation[task_settings["metric_name"]],
+    }
+    if "summary" in evaluation:
+        metrics.update(evaluation["summary"])
+    return metrics
 
 
 def train_model(resolved_config):
@@ -270,6 +306,7 @@ def train_model(resolved_config):
                 device=device,
                 task_settings=task_settings,
                 quality_supervised=quality_supervised,
+                class_values=metadata.get("class_values"),
             )
             current_lr = lr_scheduler.get_last_lr()[0]
 
@@ -315,12 +352,54 @@ def train_model(resolved_config):
 
     best_checkpoint = torch.load(f"{model_path}/best_model.pth", map_location=device)
     model.load_state_dict(best_checkpoint["model_state_dict"])
+    val_metrics = evaluate_model(
+        model,
+        val_loader,
+        device=device,
+        task_settings=task_settings,
+        quality_supervised=quality_supervised,
+        class_values=metadata.get("class_values"),
+        collect_outputs=True,
+    )
     test_metrics = evaluate_model(
         model,
         test_loader,
         device=device,
         task_settings=task_settings,
         quality_supervised=quality_supervised,
+        class_values=metadata.get("class_values"),
+        collect_outputs=True,
+    )
+    torch.save(
+        build_prediction_artifact(
+            split_name="val",
+            evaluation=val_metrics,
+            task_settings=task_settings,
+            metadata=metadata,
+        ),
+        f"{model_path}/val_predictions.pt",
+    )
+    torch.save(
+        build_prediction_artifact(
+            split_name="test",
+            evaluation=test_metrics,
+            task_settings=task_settings,
+            metadata=metadata,
+        ),
+        f"{model_path}/test_predictions.pt",
+    )
+    save_json_file(
+        {
+            "task": task_settings["task"],
+            "target_kind": task_settings["target_kind"],
+            "quality_supervised": quality_supervised,
+            "best_checkpoint_epoch": best_checkpoint["epoch"],
+            "best_validation_loss": best_checkpoint["val_loss"],
+            "metric_name": task_settings["metric_name"],
+            "val": build_metrics_record(val_metrics, task_settings=task_settings),
+            "test": build_metrics_record(test_metrics, task_settings=task_settings),
+        },
+        f"{model_path}/{DEFAULT_METRICS_PATH}",
     )
     hparam_metrics = {
         "hparam/test_loss": test_metrics["loss"],

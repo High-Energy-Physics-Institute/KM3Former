@@ -15,6 +15,12 @@ DEFAULT_TRAIN_CONFIG = {
         "dim_feedforward": 512,
         "dropout": 0.1,
         "pairwise_neighbors": 32,
+        "position_encoding": "sinusoidal",
+        "pairwise_time_transform": "raw",
+        "pairwise_distance_transform": "raw",
+        "exclude_self_from_spatial_knn": False,
+        "deduplicate_neighbors": False,
+        "pooling": "attention",
     },
     "training": {
         "batch_size": 64,
@@ -78,6 +84,12 @@ def get_model_init_kwargs(metadata, resolved_config):
         "dropout": model_config["dropout"],
         "max_hits": metadata["max_hits"],
         "pairwise_neighbors": model_config["pairwise_neighbors"],
+        "position_encoding": model_config["position_encoding"],
+        "pairwise_time_transform": model_config["pairwise_time_transform"],
+        "pairwise_distance_transform": model_config["pairwise_distance_transform"],
+        "exclude_self_from_spatial_knn": model_config["exclude_self_from_spatial_knn"],
+        "deduplicate_neighbors": model_config["deduplicate_neighbors"],
+        "pooling": model_config["pooling"],
     }
 
 

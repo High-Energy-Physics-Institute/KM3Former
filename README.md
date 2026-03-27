@@ -235,7 +235,13 @@ Default training config lives in [train.default.json](/Users/djaz89/projects/KM3
     "num_encoder_layers": 6,
     "dim_feedforward": 512,
     "dropout": 0.1,
-    "pairwise_neighbors": 32
+    "pairwise_neighbors": 32,
+    "position_encoding": "sinusoidal",
+    "pairwise_time_transform": "raw",
+    "pairwise_distance_transform": "raw",
+    "exclude_self_from_spatial_knn": false,
+    "deduplicate_neighbors": false,
+    "pooling": "attention"
   },
   "training": {
     "batch_size": 64,
@@ -261,6 +267,9 @@ Training outputs:
 - `model_epoch_N.pth`
 - `best_model.pth`
 - `resolved_train_config.json`
+- `metrics.json`
+- `val_predictions.pt`
+- `test_predictions.pt`
 - `tensorboard/`
 
 ## Inference
@@ -292,6 +301,8 @@ For `muon_count`, the output payload includes:
 - `probabilities`
 - `predicted_classes`
 - `predicted_labels`
+- `targets` when available
+- `metrics` when targets are available
 - `task`
 - `target_kind`
 
@@ -413,6 +424,21 @@ Coverage includes:
 - Inference expects already-preprocessed tensors and does not read ROOT or HDF5 directly.
 - `target_dim` means output width for the head, not the scalar width of each saved label.
 - `*_hits_raw.pt` is a legacy filename and does not mean untouched raw detector values.
+
+## Colab Ablations
+
+The stable Colab baseline config now lives at [train.muon_count.colab.json](/Users/djaz89/projects/KM3Former/configs/train.muon_count.colab.json).
+
+The fast ablation configs live under:
+
+- [exp_002_control_colab_current.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_002_control_colab_current.json)
+- [exp_003_capacity_match.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_003_capacity_match.json)
+- [exp_004_pairbias_timecompress.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_004_pairbias_timecompress.json)
+- [exp_005_pairbias_dedup.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_005_pairbias_dedup.json)
+- [exp_006_no_posenc.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_006_no_posenc.json)
+- [exp_007_pooling_upgrade.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_007_pooling_upgrade.json)
+
+The detailed ephemeral Colab workflow is documented in [colab_muon_count_runbook.md](/Users/djaz89/projects/KM3Former/docs/colab_muon_count_runbook.md).
 
 ## Next Useful Experiments
 

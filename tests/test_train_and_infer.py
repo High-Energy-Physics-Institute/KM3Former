@@ -14,7 +14,13 @@ if str(MODEL_DIR) not in sys.path:
 
 from config import DEFAULT_TRAIN_CONFIG, resolve_train_config
 from infer import main as infer_cli, run_inference
-from train import build_model, main as train_cli, resolve_quality_supervision
+from train import (
+    DEFAULT_METRICS_PATH,
+    build_model,
+    main as train_cli,
+    resolve_quality_supervision,
+    train_model,
+)
 
 
 class TrainConfigAndInferenceTestCase(unittest.TestCase):
@@ -71,6 +77,22 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         padding_mask_path = self._write_tensor("explicit_padding_mask.pt", padding_mask)
         return metadata, hits_path, raw_hits_path, padding_mask_path
 
+    def _write_split_tensors(self, split_name, event_count, target_kind="multiclass"):
+        hits = torch.randn(event_count, 4, 10, dtype=torch.float32)
+        raw_hits = torch.randn(event_count, 4, 10, dtype=torch.float32)
+        padding_mask = torch.tensor(
+            [[False, False, False, True]] * event_count,
+            dtype=torch.bool,
+        )
+        self._write_tensor(f"data/{split_name}_hits.pt", hits)
+        self._write_tensor(f"data/{split_name}_hits_raw.pt", raw_hits)
+        self._write_tensor(f"data/{split_name}_padding_mask.pt", padding_mask)
+        if target_kind == "multiclass":
+            targets = torch.arange(event_count, dtype=torch.long) % 3
+        else:
+            targets = torch.randn(event_count, 3, dtype=torch.float32)
+        self._write_tensor(f"data/{split_name}_targets.pt", targets)
+
     def test_resolve_train_config_keeps_defaults_while_applying_overrides(self):
         config_path = self._write_json(
             "train_override.json",
@@ -112,6 +134,10 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         self.assertEqual(
             resolved["training"]["learning_rate"],
             DEFAULT_TRAIN_CONFIG["training"]["learning_rate"],
+        )
+        self.assertEqual(
+            resolved["model"]["position_encoding"],
+            DEFAULT_TRAIN_CONFIG["model"]["position_encoding"],
         )
         self.assertEqual(predictions.shape, torch.Size([2, 3]))
         self.assertEqual(quality.shape, torch.Size([2]))
@@ -364,6 +390,7 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
             hits_file=str(hits_path),
             raw_hits_file=str(raw_hits_path),
             padding_mask_file=str(padding_mask_path),
+            target_file=str(self._write_tensor("explicit_targets.pt", torch.tensor([0, 2]))),
             batch_size=1,
             device="cpu",
         )
@@ -374,8 +401,71 @@ class TrainConfigAndInferenceTestCase(unittest.TestCase):
         self.assertEqual(payload["probabilities"].shape, torch.Size([2, 3]))
         self.assertEqual(payload["predicted_classes"].shape, torch.Size([2]))
         self.assertEqual(payload["predicted_labels"].shape, torch.Size([2]))
+        self.assertEqual(payload["targets"].shape, torch.Size([2]))
+        self.assertIn("metrics", payload)
+        self.assertIn("confusion_matrix", payload["metrics"])
         self.assertFalse(payload["supports_quality"])
         self.assertNotIn("quality", payload)
+
+    def test_train_model_writes_metrics_and_prediction_artifacts(self):
+        self._write_json(
+            "data/metadata.json",
+            {
+                "task": "muon_count",
+                "target_kind": "multiclass",
+                "target_name": "muon_count",
+                "target_dim": 3,
+                "input_dim": 10,
+                "max_hits": 4,
+                "class_values": [0, 1, 2],
+            },
+        )
+        self._write_split_tensors("train", event_count=3)
+        self._write_split_tensors("val", event_count=2)
+        self._write_split_tensors("test", event_count=2)
+        resolved_config = resolve_train_config(
+            overrides={
+                "paths": {
+                    "data_path": str(self.data_dir),
+                    "model_path": str(self.model_dir),
+                },
+                "model": {
+                    "model_dim": 16,
+                    "num_heads": 4,
+                    "num_encoder_layers": 1,
+                    "dim_feedforward": 32,
+                    "pairwise_neighbors": 2,
+                    "position_encoding": "none",
+                    "pairwise_time_transform": "signed_log1p",
+                    "pairwise_distance_transform": "log1p",
+                    "exclude_self_from_spatial_knn": True,
+                    "deduplicate_neighbors": True,
+                    "pooling": "attention_mean_concat",
+                },
+                "training": {
+                    "batch_size": 1,
+                    "epochs": 1,
+                },
+                "loader": {
+                    "train_max_workers": 0,
+                    "eval_max_workers": 0,
+                },
+            }
+        )
+
+        metrics = train_model(resolved_config=resolved_config)
+
+        self.assertIn("accuracy", metrics)
+        self.assertTrue((self.model_dir / DEFAULT_METRICS_PATH).exists())
+        self.assertTrue((self.model_dir / "val_predictions.pt").exists())
+        self.assertTrue((self.model_dir / "test_predictions.pt").exists())
+        metrics_payload = json.loads(
+            (self.model_dir / DEFAULT_METRICS_PATH).read_text(encoding="ascii")
+        )
+        self.assertIn("val", metrics_payload)
+        self.assertIn("test", metrics_payload)
+        self.assertIn("macro_f1", metrics_payload["test"])
+        self.assertIn("confusion_matrix", metrics_payload["test"])
 
     def test_resolve_quality_supervision_rejects_mixed_split_capabilities(self):
         class DatasetStub:

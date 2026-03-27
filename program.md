@@ -355,3 +355,30 @@ The program should no longer describe nonexistent filenames or a generic templat
 4. collect checkpoint, config, metadata snapshot, and predictions for later comparison
 5. append a short summary entry to `results.md`
 6. infer on the test split and keep the predictions with the same experiment artifacts
+
+## Colab Fast Ablation Wave
+
+For the GPU ablation wave, use the stable Colab baseline config:
+
+- `configs/train.muon_count.colab.json`
+
+Experiment-specific overrides live in:
+
+- `configs/experiments/exp_002_control_colab_current.json`
+- `configs/experiments/exp_003_capacity_match.json`
+- `configs/experiments/exp_004_pairbias_timecompress.json`
+- `configs/experiments/exp_005_pairbias_dedup.json`
+- `configs/experiments/exp_006_no_posenc.json`
+- `configs/experiments/exp_007_pooling_upgrade.json`
+
+The detailed Colab instructions for ephemeral `/content` runs are documented in:
+
+- `docs/colab_muon_count_runbook.md`
+
+New experiment outputs now include:
+
+- `metrics.json`
+- `val_predictions.pt`
+- `test_predictions.pt`
+
+For the ablation ladder, prefer validation macro-F1 and class-`1` recall as the main promotion signal, and use test accuracy as a secondary comparison metric.

@@ -4,15 +4,15 @@
     "model_path": "./runs/muon_count_colab"
   },
   "model": {
-    "model_dim": 128,
+    "model_dim": 64,
     "num_heads": 4,
-    "num_encoder_layers": 4,
-    "dim_feedforward": 256,
+    "num_encoder_layers": 3,
+    "dim_feedforward": 128,
     "dropout": 0.1,
-    "pairwise_neighbors": 16
+    "pairwise_neighbors": 8
   },
   "training": {
-    "batch_size": 64,
+    "batch_size": 8,
     "learning_rate": 0.0008,
     "epochs": 10
   },

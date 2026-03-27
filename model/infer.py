@@ -4,7 +4,11 @@ from pathlib import Path
 import click
 import torch
 from config import get_model_init_kwargs, resolve_train_config
-from eval import resolve_task_settings
+from eval import (
+    build_evaluation_summary,
+    multiclass_outputs_from_logits,
+    resolve_task_settings,
+)
 from km3former import KM3Former
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -20,19 +24,25 @@ def resolve_input_paths(
     hits_file=None,
     raw_hits_file=None,
     padding_mask_file=None,
+    target_file=None,
 ):
     if split is not None and any(
-        path is not None for path in (hits_file, raw_hits_file, padding_mask_file)
+        path is not None
+        for path in (hits_file, raw_hits_file, padding_mask_file, target_file)
     ):
         raise click.UsageError(
             "Use either --split or explicit tensor paths, not both."
         )
 
     if split is not None:
+        default_target_file = f"{data_path}/{split}_targets.pt"
         return {
             "hits_file": f"{data_path}/{split}_hits.pt",
             "raw_hits_file": f"{data_path}/{split}_hits_raw.pt",
             "padding_mask_file": f"{data_path}/{split}_padding_mask.pt",
+            "target_file": (
+                default_target_file if Path(default_target_file).exists() else None
+            ),
         }
 
     if None in (hits_file, raw_hits_file, padding_mask_file):
@@ -44,6 +54,7 @@ def resolve_input_paths(
         "hits_file": hits_file,
         "raw_hits_file": raw_hits_file,
         "padding_mask_file": padding_mask_file,
+        "target_file": target_file,
     }
 
 
@@ -51,12 +62,17 @@ def load_inference_tensors(input_paths):
     hits = torch.load(input_paths["hits_file"], map_location="cpu")
     raw_hits = torch.load(input_paths["raw_hits_file"], map_location="cpu")
     padding_mask = torch.load(input_paths["padding_mask_file"], map_location="cpu")
+    targets = None
+    if input_paths.get("target_file") is not None:
+        targets = torch.load(input_paths["target_file"], map_location="cpu")
 
     lengths = {len(hits), len(raw_hits), len(padding_mask)}
+    if targets is not None:
+        lengths.add(len(targets))
     if len(lengths) != 1:
         raise ValueError("Inference tensors must share the same first dimension.")
 
-    return hits, raw_hits, padding_mask
+    return hits, raw_hits, padding_mask, targets
 
 
 def load_runtime_artifacts(data_path, metadata_path=None, stats_path=None):
@@ -87,9 +103,12 @@ def build_model_from_checkpoint(metadata, checkpoint, device):
     return model, resolved_config
 
 
-def build_inference_loader(hits, raw_hits, padding_mask, batch_size):
-    # Inference only needs the three tensors consumed by the forward path.
-    dataset = TensorDataset(hits, raw_hits, padding_mask)
+def build_inference_loader(hits, raw_hits, padding_mask, batch_size, targets=None):
+    # Inference only needs the tensors consumed by the forward path, plus optional targets.
+    tensors = (hits, raw_hits, padding_mask)
+    if targets is not None:
+        tensors = tensors + (targets,)
+    dataset = TensorDataset(*tensors)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
@@ -97,10 +116,14 @@ def build_inference_loader(hits, raw_hits, padding_mask, batch_size):
 def predict_batches(model, data_loader, device, quality_supervised, task_settings):
     predictions = []
     quality_scores = [] if quality_supervised else None
-    class_predictions = [] if task_settings["target_kind"] == "multiclass" else None
-    probabilities = [] if task_settings["target_kind"] == "multiclass" else None
+    targets = []
 
-    for hits, raw_hits, padding_mask in data_loader:
+    for batch in data_loader:
+        if len(batch) == 4:
+            hits, raw_hits, padding_mask, batch_targets = batch
+            targets.append(batch_targets.cpu())
+        else:
+            hits, raw_hits, padding_mask = batch
         hits = hits.to(device)
         raw_hits = raw_hits.to(device)
         padding_mask = padding_mask.to(device)
@@ -119,29 +142,40 @@ def predict_batches(model, data_loader, device, quality_supervised, task_setting
         predictions.append(batch_predictions.cpu())
         if quality_supervised:
             quality_scores.append(batch_quality.cpu())
-        if task_settings["target_kind"] == "multiclass":
-            batch_probabilities = torch.softmax(batch_predictions, dim=-1)
-            probabilities.append(batch_probabilities.cpu())
-            class_predictions.append(torch.argmax(batch_predictions, dim=-1).cpu())
 
     output = {"predictions": torch.cat(predictions, dim=0)}
     if quality_supervised:
         output["quality"] = torch.cat(quality_scores, dim=0)
+    if targets:
+        output["targets"] = torch.cat(targets, dim=0)
     if task_settings["target_kind"] == "multiclass":
-        output["probabilities"] = torch.cat(probabilities, dim=0)
-        output["predicted_classes"] = torch.cat(class_predictions, dim=0)
+        output.update(multiclass_outputs_from_logits(output["predictions"]))
     return output
+
+
+def _make_json_serializable(value):
+    if isinstance(value, torch.Tensor):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {
+            key: _make_json_serializable(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_make_json_serializable(item) for item in value]
+    return value
 
 
 def save_inference_output(output_path, payload):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     if output_path.endswith(".json"):
-        serializable_payload = {
-            key: value.tolist() if isinstance(value, torch.Tensor) else value
-            for key, value in payload.items()
-        }
         with open(output_path, "w", encoding="ascii") as output_file:
-            json.dump(serializable_payload, output_file, indent=2, sort_keys=True)
+            json.dump(
+                _make_json_serializable(payload),
+                output_file,
+                indent=2,
+                sort_keys=True,
+            )
         return
 
     torch.save(payload, output_path)
@@ -155,6 +189,7 @@ def run_inference(
     hits_file=None,
     raw_hits_file=None,
     padding_mask_file=None,
+    target_file=None,
     metadata_path=None,
     stats_path=None,
     batch_size=256,
@@ -166,6 +201,7 @@ def run_inference(
         hits_file=hits_file,
         raw_hits_file=raw_hits_file,
         padding_mask_file=padding_mask_file,
+        target_file=target_file,
     )
     metadata, feature_stats, resolved_metadata_path, resolved_stats_path = (
         load_runtime_artifacts(
@@ -175,7 +211,7 @@ def run_inference(
         )
     )
     task_settings = resolve_task_settings(metadata)
-    hits, raw_hits, padding_mask = load_inference_tensors(input_paths=input_paths)
+    hits, raw_hits, padding_mask, targets = load_inference_tensors(input_paths=input_paths)
 
     resolved_device = torch.device(
         device
@@ -196,6 +232,7 @@ def run_inference(
         hits=hits,
         raw_hits=raw_hits,
         padding_mask=padding_mask,
+        targets=targets,
         batch_size=batch_size,
     )
     predictions = predict_batches(
@@ -230,6 +267,13 @@ def run_inference(
             payload["predicted_labels"] = torch.tensor(
                 [class_values[index] for index in predictions["predicted_classes"].tolist()]
             )
+    if "targets" in predictions:
+        payload["targets"] = predictions["targets"]
+        payload["metrics"] = build_evaluation_summary(
+            outputs=predictions,
+            task_settings=task_settings,
+            class_values=metadata.get("class_values"),
+        )
     save_inference_output(output_path=output_path, payload=payload)
     return payload
 
@@ -272,6 +316,12 @@ def run_inference(
     help="Explicit padding mask tensor path.",
 )
 @click.option(
+    "--target-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Optional explicit target tensor path for evaluation-ready outputs.",
+)
+@click.option(
     "--data-path",
     type=click.Path(file_okay=False, path_type=str),
     default="./data",
@@ -310,6 +360,7 @@ def main(
     hits_file,
     raw_hits_file,
     padding_mask_file,
+    target_file,
     data_path,
     metadata_path,
     stats_path,
@@ -324,6 +375,7 @@ def main(
         hits_file=hits_file,
         raw_hits_file=raw_hits_file,
         padding_mask_file=padding_mask_file,
+        target_file=target_file,
         metadata_path=metadata_path,
         stats_path=stats_path,
         batch_size=batch_size,

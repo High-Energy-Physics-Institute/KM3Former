@@ -62,6 +62,12 @@ class KM3Former(nn.Module):
         pairwise_hidden_dim=None,
         target_dim=3,
         target_kind="vector_regression",
+        position_encoding="sinusoidal",
+        pairwise_time_transform="raw",
+        pairwise_distance_transform="raw",
+        exclude_self_from_spatial_knn=False,
+        deduplicate_neighbors=False,
+        pooling="attention",
     ):
         super().__init__()
         self.model_dim = model_dim
@@ -74,11 +80,16 @@ class KM3Former(nn.Module):
             nn.Linear(model_dim, model_dim),
             nn.LayerNorm(model_dim),
         )
-        self.positional_encoding = PositionalEncoding(
-            d_model=model_dim,
-            dropout=dropout,
-            max_len=max_hits,
-        )
+        if position_encoding == "sinusoidal":
+            self.positional_encoding = PositionalEncoding(
+                d_model=model_dim,
+                dropout=dropout,
+                max_len=max_hits,
+            )
+        elif position_encoding == "none":
+            self.positional_encoding = NoOpPositionalEncoding()
+        else:
+            raise ValueError(f"Unsupported position_encoding: {position_encoding!r}")
         self.encoder_layers = nn.ModuleList(
             [
                 SparseNeighborhoodEncoderLayer(
@@ -88,14 +99,38 @@ class KM3Former(nn.Module):
                     dropout=dropout,
                     pairwise_hidden_dim=pairwise_hidden_dim or model_dim,
                     pairwise_neighbors=pairwise_neighbors,
+                    pairwise_time_transform=pairwise_time_transform,
+                    pairwise_distance_transform=pairwise_distance_transform,
+                    exclude_self_from_spatial_knn=exclude_self_from_spatial_knn,
+                    deduplicate_neighbors=deduplicate_neighbors,
                 )
                 for _ in range(num_encoder_layers)
             ]
         )
         self.final_norm = nn.LayerNorm(model_dim)
-        self.pooler = MaskedAttentionPooling(model_dim=model_dim)
-        self.fc_out = nn.Linear(model_dim, target_dim)
-        self.quality_head = nn.Linear(model_dim, 1)
+        if pooling == "attention":
+            self.pooler = MaskedAttentionPooling(model_dim=model_dim)
+            pooled_dim = model_dim
+        elif pooling == "attention_mean_concat":
+            self.pooler = AttentionMeanConcatPooling(model_dim=model_dim)
+            pooled_dim = model_dim * 2
+        else:
+            raise ValueError(f"Unsupported pooling: {pooling!r}")
+
+        if pooling == "attention_mean_concat":
+            self.fc_out = nn.Sequential(
+                nn.Linear(pooled_dim, model_dim),
+                nn.GELU(),
+                nn.Linear(model_dim, target_dim),
+            )
+            self.quality_head = nn.Sequential(
+                nn.Linear(pooled_dim, model_dim),
+                nn.GELU(),
+                nn.Linear(model_dim, 1),
+            )
+        else:
+            self.fc_out = nn.Linear(pooled_dim, target_dim)
+            self.quality_head = nn.Linear(pooled_dim, 1)
 
     def forward(self, src, raw_hits=None, padding_mask=None, return_quality=False):
         if padding_mask is None:
@@ -144,6 +179,10 @@ class SparseNeighborhoodEncoderLayer(nn.Module):
         dropout,
         pairwise_hidden_dim,
         pairwise_neighbors,
+        pairwise_time_transform,
+        pairwise_distance_transform,
+        exclude_self_from_spatial_knn,
+        deduplicate_neighbors,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(model_dim)
@@ -154,6 +193,10 @@ class SparseNeighborhoodEncoderLayer(nn.Module):
             pairwise_hidden_dim=pairwise_hidden_dim,
             time_neighbors=pairwise_neighbors,
             spatial_neighbors=pairwise_neighbors,
+            pairwise_time_transform=pairwise_time_transform,
+            pairwise_distance_transform=pairwise_distance_transform,
+            exclude_self_from_spatial_knn=exclude_self_from_spatial_knn,
+            deduplicate_neighbors=deduplicate_neighbors,
         )
         self.dropout1 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(model_dim)
@@ -191,6 +234,10 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         time_neighbors=32,
         spatial_neighbors=32,
         spatial_chunk_size=64,
+        pairwise_time_transform="raw",
+        pairwise_distance_transform="raw",
+        exclude_self_from_spatial_knn=False,
+        deduplicate_neighbors=False,
     ):
         super().__init__()
         if model_dim % num_heads != 0:
@@ -202,6 +249,8 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         self.time_neighbors = time_neighbors
         self.spatial_neighbors = spatial_neighbors
         self.spatial_chunk_size = spatial_chunk_size
+        self.exclude_self_from_spatial_knn = exclude_self_from_spatial_knn
+        self.deduplicate_neighbors = deduplicate_neighbors
 
         self.q_proj = nn.Linear(model_dim, model_dim)
         self.k_proj = nn.Linear(model_dim, model_dim)
@@ -211,6 +260,8 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         self.pairwise_bias = PairwiseAttentionBias(
             num_heads=num_heads,
             hidden_dim=pairwise_hidden_dim,
+            time_transform=pairwise_time_transform,
+            distance_transform=pairwise_distance_transform,
         )
 
     def forward(self, hidden_states, raw_hits, padding_mask=None):
@@ -282,6 +333,11 @@ class SparseNeighborhoodSelfAttention(nn.Module):
 
         neighbor_indices = torch.cat([time_indices, spatial_indices], dim=-1)
         neighbor_mask = torch.cat([time_mask, spatial_mask], dim=-1)
+        if self.deduplicate_neighbors:
+            neighbor_mask = self._deduplicate_neighbor_mask(
+                neighbor_indices=neighbor_indices,
+                neighbor_mask=neighbor_mask,
+            )
 
         if padding_mask is None:
             return neighbor_indices, neighbor_mask
@@ -314,7 +370,10 @@ class SparseNeighborhoodSelfAttention(nn.Module):
     def _build_spatial_knn_indices(self, raw_hits, padding_mask=None):
         batch_size, num_hits, _ = raw_hits.shape
         device = raw_hits.device
-        k_neighbors = min(self.spatial_neighbors, num_hits)
+        available_neighbors = (
+            max(num_hits - 1, 0) if self.exclude_self_from_spatial_knn else num_hits
+        )
+        k_neighbors = min(self.spatial_neighbors, available_neighbors)
 
         if k_neighbors == 0:
             empty_indices = torch.empty(
@@ -335,32 +394,51 @@ class SparseNeighborhoodSelfAttention(nn.Module):
 
         positions = raw_hits[..., 1:4]
         all_indices = []
+        all_masks = []
 
         for start in range(0, num_hits, self.spatial_chunk_size):
             end = min(start + self.spatial_chunk_size, num_hits)
             query_positions = positions[:, start:end]
             distances = torch.cdist(query_positions, positions)
 
+            # Keep spatial neighborhoods distinct from the mandatory time-window self edge.
+            if self.exclude_self_from_spatial_knn:
+                query_axis = torch.arange(end - start, device=device)
+                global_query_indices = torch.arange(start, end, device=device)
+                distances[:, query_axis, global_query_indices] = float("inf")
+
             if padding_mask is not None:
                 invalid_keys = padding_mask.unsqueeze(1).expand(-1, end - start, -1)
                 distances = distances.masked_fill(invalid_keys, float("inf"))
 
-            neighbor_indices = torch.topk(
+            topk = torch.topk(
                 distances,
                 k=k_neighbors,
                 largest=False,
                 dim=-1,
-            ).indices
-            all_indices.append(neighbor_indices)
+            )
+            all_indices.append(topk.indices)
+            all_masks.append(torch.isfinite(topk.values))
 
         spatial_indices = torch.cat(all_indices, dim=1)
-        spatial_mask = torch.ones_like(spatial_indices, dtype=torch.bool, device=device)
+        spatial_mask = torch.cat(all_masks, dim=1)
         return spatial_indices, spatial_mask
 
     def _get_query_valid_mask(self, batch_size, num_hits, padding_mask, device):
         if padding_mask is None:
             return torch.ones(batch_size, num_hits, dtype=torch.bool, device=device)
         return ~padding_mask
+
+    def _deduplicate_neighbor_mask(self, neighbor_indices, neighbor_mask):
+        deduplicated = neighbor_mask.clone()
+        for slot in range(neighbor_indices.size(-1)):
+            if slot == 0:
+                continue
+            duplicate = (
+                neighbor_indices[..., :slot] == neighbor_indices[..., slot : slot + 1]
+            ).any(dim=-1)
+            deduplicated[..., slot] = deduplicated[..., slot] & ~duplicate
+        return deduplicated
 
 
 class MaskedAttentionPooling(nn.Module):
@@ -386,9 +464,44 @@ class MaskedAttentionPooling(nn.Module):
         return torch.sum(memory * weights.unsqueeze(-1), dim=1)
 
 
-class PairwiseAttentionBias(nn.Module):
-    def __init__(self, num_heads, hidden_dim):
+class MaskedMeanPooling(nn.Module):
+    def forward(self, memory, padding_mask=None):
+        if padding_mask is None:
+            return memory.mean(dim=1)
+
+        valid_mask = (~padding_mask).unsqueeze(-1).to(dtype=memory.dtype)
+        return (memory * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1.0)
+
+
+class AttentionMeanConcatPooling(nn.Module):
+    def __init__(self, model_dim):
         super().__init__()
+        self.attention_pool = MaskedAttentionPooling(model_dim=model_dim)
+        self.mean_pool = MaskedMeanPooling()
+
+    def forward(self, memory, padding_mask=None):
+        attention_summary = self.attention_pool(memory, padding_mask=padding_mask)
+        mean_summary = self.mean_pool(memory, padding_mask=padding_mask)
+        return torch.cat([attention_summary, mean_summary], dim=-1)
+
+
+class PairwiseAttentionBias(nn.Module):
+    def __init__(
+        self,
+        num_heads,
+        hidden_dim,
+        time_transform="raw",
+        distance_transform="raw",
+    ):
+        super().__init__()
+        if time_transform not in {"raw", "signed_log1p"}:
+            raise ValueError(f"Unsupported time_transform: {time_transform!r}")
+        if distance_transform not in {"raw", "log1p"}:
+            raise ValueError(
+                f"Unsupported distance_transform: {distance_transform!r}"
+            )
+        self.time_transform = time_transform
+        self.distance_transform = distance_transform
         self.bias_mlp = nn.Sequential(
             nn.Linear(8, hidden_dim),
             nn.GELU(),
@@ -408,6 +521,19 @@ class PairwiseAttentionBias(nn.Module):
         delta_t = source_times - target_times
         delta_pos = source_positions - target_positions
         distance = torch.linalg.norm(delta_pos, dim=-1)
+        delta_t_abs = delta_t.abs()
+
+        if self.time_transform == "signed_log1p":
+            signed_delta_t = torch.sign(delta_t) * torch.log1p(delta_t_abs)
+            delta_t_magnitude = torch.log1p(delta_t_abs)
+        else:
+            signed_delta_t = delta_t
+            delta_t_magnitude = delta_t_abs
+
+        if self.distance_transform == "log1p":
+            distance_feature = torch.log1p(distance)
+        else:
+            distance_feature = distance
 
         safe_distance = distance.unsqueeze(-1).clamp(min=1e-6)
         direction_to_neighbor = delta_pos / safe_distance
@@ -416,18 +542,23 @@ class PairwiseAttentionBias(nn.Module):
 
         pair_features = torch.stack(
             [
-                delta_t,
-                delta_t.abs(),
+                signed_delta_t,
+                delta_t_magnitude,
                 delta_pos[..., 0],
                 delta_pos[..., 1],
                 delta_pos[..., 2],
-                distance,
+                distance_feature,
                 orientation_source,
                 orientation_target,
             ],
             dim=-1,
         )
         return self.bias_mlp(pair_features).permute(0, 3, 1, 2)
+
+
+class NoOpPositionalEncoding(nn.Module):
+    def forward(self, x):
+        return x
 
 
 class PositionalEncoding(nn.Module):
