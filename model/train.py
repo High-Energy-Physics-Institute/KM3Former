@@ -120,9 +120,13 @@ def build_prediction_artifact(split_name, evaluation, task_settings, metadata):
     }
     if "quality" in outputs:
         payload["quality"] = outputs["quality"]
+    if "confidence" in outputs:
+        payload["confidence"] = outputs["confidence"]
     if task_settings["target_kind"] == "multiclass":
         payload["probabilities"] = outputs["probabilities"]
         payload["predicted_classes"] = outputs["predicted_classes"]
+        if "threshold_logits" in outputs:
+            payload["threshold_logits"] = outputs["threshold_logits"]
         if "class_values" in metadata:
             class_values = metadata["class_values"]
             payload["predicted_labels"] = torch.tensor(
@@ -153,7 +157,10 @@ def train_model(resolved_config):
     eval_max_workers = resolved_config["loader"]["eval_max_workers"]
 
     metadata = load_metadata(data_path=data_path)
-    task_settings = resolve_task_settings(metadata)
+    task_settings = resolve_task_settings(
+        metadata,
+        count_head=resolved_config["model"].get("count_head", "multiclass"),
+    )
 
     os.makedirs(model_path, exist_ok=True)
     # Save the final merged config so each checkpoint directory is self-describing.

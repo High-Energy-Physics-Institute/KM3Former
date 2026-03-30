@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-def resolve_task_settings(metadata):
+def resolve_task_settings(metadata, count_head="multiclass"):
     task_name = metadata.get("task", "direction")
     target_kind = metadata.get("target_kind", "vector_regression")
     target_name = metadata.get("target_name", "muon_direction")
@@ -30,6 +30,7 @@ def resolve_task_settings(metadata):
             "metric_name": "accuracy",
             "metric_label": "Accuracy",
             "prediction_label": "logits",
+            "count_head": count_head,
         }
 
     raise ValueError(f"Unsupported target kind: {target_kind!r}")
@@ -72,6 +73,62 @@ def classification_loss(logits, target):
     return F.cross_entropy(logits, target.long())
 
 
+def ordinal_coral_levels(target, num_classes):
+    thresholds = torch.arange(
+        num_classes - 1,
+        device=target.device,
+        dtype=target.dtype,
+    )
+    return (target.unsqueeze(-1) > thresholds).to(dtype=torch.float32)
+
+
+def ordinal_coral_loss(threshold_logits, target, num_classes):
+    levels = ordinal_coral_levels(target.long(), num_classes=num_classes)
+    return F.binary_cross_entropy_with_logits(threshold_logits, levels)
+
+
+def ordinal_probabilities_from_logits(threshold_logits, num_classes):
+    level_probabilities = torch.sigmoid(threshold_logits)
+    probability_slices = [1.0 - level_probabilities[..., :1]]
+    for class_index in range(1, num_classes - 1):
+        probability_slices.append(
+            level_probabilities[..., class_index - 1 : class_index]
+            - level_probabilities[..., class_index : class_index + 1]
+        )
+    probability_slices.append(level_probabilities[..., -1:])
+    probabilities = torch.cat(probability_slices, dim=-1)
+    return probabilities.clamp(min=0.0)
+
+
+def multiclass_outputs_from_prediction(prediction, task_settings):
+    if task_settings.get("count_head") == "ordinal_coral":
+        probabilities = ordinal_probabilities_from_logits(
+            prediction,
+            num_classes=task_settings["target_dim"],
+        )
+        normalized_probabilities = probabilities / probabilities.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=1e-6)
+        predicted_classes = torch.argmax(normalized_probabilities, dim=-1)
+        return {
+            "predictions": torch.log(normalized_probabilities.clamp(min=1e-6)),
+            "threshold_logits": prediction,
+            "probabilities": normalized_probabilities,
+            "predicted_classes": predicted_classes,
+            "confidence": normalized_probabilities.max(dim=-1).values,
+        }
+
+    probabilities = torch.softmax(prediction, dim=-1)
+    predicted_classes = torch.argmax(prediction, dim=-1)
+    return {
+        "predictions": prediction,
+        "probabilities": probabilities,
+        "predicted_classes": predicted_classes,
+        "confidence": probabilities.max(dim=-1).values,
+    }
+
+
 def compute_task_loss(
     prediction,
     target,
@@ -87,6 +144,12 @@ def compute_task_loss(
             quality_target=quality_target,
         )
     if task_settings["target_kind"] == "multiclass":
+        if task_settings.get("count_head") == "ordinal_coral":
+            return ordinal_coral_loss(
+                prediction,
+                target,
+                num_classes=task_settings["target_dim"],
+            )
         return classification_loss(prediction, target)
     raise ValueError(f"Unsupported target kind: {task_settings['target_kind']!r}")
 
@@ -95,6 +158,12 @@ def compute_task_metric(prediction, target, task_settings):
     if task_settings["target_kind"] == "vector_regression":
         return angular_error_degrees(prediction, target)
     if task_settings["target_kind"] == "multiclass":
+        if task_settings.get("count_head") == "ordinal_coral":
+            predicted_classes = multiclass_outputs_from_prediction(
+                prediction,
+                task_settings=task_settings,
+            )["predicted_classes"]
+            return (predicted_classes == target.long()).to(dtype=torch.float32).mean()
         return multiclass_accuracy(prediction, target)
     raise ValueError(f"Unsupported target kind: {task_settings['target_kind']!r}")
 
@@ -111,15 +180,6 @@ def move_batch_dict_to_device(batch, device):
     }
 
 
-def multiclass_outputs_from_logits(logits):
-    probabilities = torch.softmax(logits, dim=-1)
-    predicted_classes = torch.argmax(logits, dim=-1)
-    return {
-        "probabilities": probabilities,
-        "predicted_classes": predicted_classes,
-    }
-
-
 def confusion_matrix_from_predictions(predicted_classes, target, num_classes):
     flattened = target.long() * num_classes + predicted_classes.long()
     return torch.bincount(
@@ -132,9 +192,10 @@ def _label_strings(class_values):
     return [str(label) for label in class_values]
 
 
-def build_multiclass_summary(predictions, targets, class_values=None):
-    probabilities = torch.softmax(predictions, dim=-1)
-    predicted_classes = torch.argmax(predictions, dim=-1)
+def build_multiclass_summary(predictions, targets, class_values=None, probabilities=None):
+    if probabilities is None:
+        probabilities = torch.softmax(predictions, dim=-1)
+    predicted_classes = torch.argmax(probabilities, dim=-1)
     num_classes = predictions.size(-1)
     resolved_class_values = list(
         class_values if class_values is not None else range(num_classes)
@@ -211,6 +272,7 @@ def build_evaluation_summary(outputs, task_settings, class_values=None):
             predictions=outputs["predictions"],
             targets=outputs["targets"],
             class_values=class_values,
+            probabilities=outputs.get("probabilities"),
         )
 
     return build_regression_summary(
@@ -290,14 +352,19 @@ def evaluate_model(
     if not collect_outputs:
         return results
 
-    outputs = {
-        "predictions": torch.cat(collected_predictions, dim=0),
-        "targets": torch.cat(collected_targets, dim=0),
-    }
+    raw_predictions = torch.cat(collected_predictions, dim=0)
+    outputs = {"targets": torch.cat(collected_targets, dim=0)}
+    if task_settings["target_kind"] == "multiclass":
+        outputs.update(
+            multiclass_outputs_from_prediction(
+                raw_predictions,
+                task_settings=task_settings,
+            )
+        )
+    else:
+        outputs["predictions"] = raw_predictions
     if quality_supervised:
         outputs["quality"] = torch.cat(collected_quality, dim=0)
-    if task_settings["target_kind"] == "multiclass":
-        outputs.update(multiclass_outputs_from_logits(outputs["predictions"]))
 
     results["outputs"] = outputs
     results["summary"] = build_evaluation_summary(

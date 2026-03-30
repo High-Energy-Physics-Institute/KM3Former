@@ -11,7 +11,7 @@
     "pairwise_distance_transform": "log1p",
     "exclude_self_from_spatial_knn": true,
     "deduplicate_neighbors": true,
-    "pooling": "attention_mean_concat"
+    "pooling": "attention_mean_sum_count_concat"
   },
   "training": {
     "batch_size": 32

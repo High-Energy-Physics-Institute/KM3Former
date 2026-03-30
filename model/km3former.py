@@ -4,6 +4,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+TOT_FEATURE_INDEX = 7
+DEFAULT_PROPAGATION_SPEED = 0.225
+
+
+def resolve_neighbor_counts(
+    pairwise_neighbors=None,
+    time_neighbors=None,
+    spatial_neighbors=None,
+):
+    shared_neighbors = 32 if pairwise_neighbors is None else pairwise_neighbors
+    resolved_time_neighbors = (
+        shared_neighbors if time_neighbors is None else time_neighbors
+    )
+    resolved_spatial_neighbors = (
+        shared_neighbors if spatial_neighbors is None else spatial_neighbors
+    )
+    return resolved_time_neighbors, resolved_spatial_neighbors
+
 
 def gather_token_neighbors(token_tensor, neighbor_indices):
     batch_size, num_hits, _ = neighbor_indices.shape
@@ -59,20 +77,38 @@ class KM3Former(nn.Module):
         dropout=0.1,
         max_hits=512,
         pairwise_neighbors=32,
+        time_neighbors=None,
+        spatial_neighbors=None,
         pairwise_hidden_dim=None,
         target_dim=3,
         target_kind="vector_regression",
         position_encoding="sinusoidal",
+        time_neighborhood_mode="index_window",
+        time_radius=None,
         pairwise_time_transform="raw",
         pairwise_distance_transform="raw",
+        pairwise_feature_version="v1",
         exclude_self_from_spatial_knn=False,
         deduplicate_neighbors=False,
         pooling="attention",
+        count_head="multiclass",
+        pairwise_position_scale=1.0,
+        propagation_speed=DEFAULT_PROPAGATION_SPEED,
     ):
         super().__init__()
         self.model_dim = model_dim
         self.target_dim = target_dim
         self.target_kind = target_kind
+        self.count_head = count_head
+        self.time_neighbors, self.spatial_neighbors = resolve_neighbor_counts(
+            pairwise_neighbors=pairwise_neighbors,
+            time_neighbors=time_neighbors,
+            spatial_neighbors=spatial_neighbors,
+        )
+        if count_head not in {"multiclass", "ordinal_coral"}:
+            raise ValueError(f"Unsupported count_head: {count_head!r}")
+        if target_kind != "multiclass" and count_head != "multiclass":
+            raise ValueError("count_head is only supported for multiclass targets.")
 
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, model_dim),
@@ -98,11 +134,17 @@ class KM3Former(nn.Module):
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
                     pairwise_hidden_dim=pairwise_hidden_dim or model_dim,
-                    pairwise_neighbors=pairwise_neighbors,
+                    time_neighbors=self.time_neighbors,
+                    spatial_neighbors=self.spatial_neighbors,
+                    time_neighborhood_mode=time_neighborhood_mode,
+                    time_radius=time_radius,
                     pairwise_time_transform=pairwise_time_transform,
                     pairwise_distance_transform=pairwise_distance_transform,
+                    pairwise_feature_version=pairwise_feature_version,
                     exclude_self_from_spatial_knn=exclude_self_from_spatial_knn,
                     deduplicate_neighbors=deduplicate_neighbors,
+                    pairwise_position_scale=pairwise_position_scale,
+                    propagation_speed=propagation_speed,
                 )
                 for _ in range(num_encoder_layers)
             ]
@@ -114,14 +156,19 @@ class KM3Former(nn.Module):
         elif pooling == "attention_mean_concat":
             self.pooler = AttentionMeanConcatPooling(model_dim=model_dim)
             pooled_dim = model_dim * 2
+        elif pooling == "attention_mean_sum_count_concat":
+            self.pooler = AttentionMeanSumCountConcatPooling(model_dim=model_dim)
+            pooled_dim = model_dim * 3 + 1
         else:
             raise ValueError(f"Unsupported pooling: {pooling!r}")
 
-        if pooling == "attention_mean_concat":
-            self.fc_out = nn.Sequential(
-                nn.Linear(pooled_dim, model_dim),
-                nn.GELU(),
-                nn.Linear(model_dim, target_dim),
+        if pooling in {
+            "attention_mean_concat",
+            "attention_mean_sum_count_concat",
+        }:
+            self.fc_out = self._build_projected_output_head(
+                pooled_dim=pooled_dim,
+                model_dim=model_dim,
             )
             self.quality_head = nn.Sequential(
                 nn.Linear(pooled_dim, model_dim),
@@ -129,8 +176,24 @@ class KM3Former(nn.Module):
                 nn.Linear(model_dim, 1),
             )
         else:
-            self.fc_out = nn.Linear(pooled_dim, target_dim)
+            if self.target_kind == "multiclass" and self.count_head == "ordinal_coral":
+                self.fc_out = CoralOrdinalHead(pooled_dim, target_dim)
+            else:
+                self.fc_out = nn.Linear(pooled_dim, target_dim)
             self.quality_head = nn.Linear(pooled_dim, 1)
+
+    def _build_projected_output_head(self, pooled_dim, model_dim):
+        if self.target_kind == "multiclass" and self.count_head == "ordinal_coral":
+            return nn.Sequential(
+                nn.Linear(pooled_dim, model_dim),
+                nn.GELU(),
+                CoralOrdinalHead(model_dim, self.target_dim),
+            )
+        return nn.Sequential(
+            nn.Linear(pooled_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, self.target_dim),
+        )
 
     def forward(self, src, raw_hits=None, padding_mask=None, return_quality=False):
         if padding_mask is None:
@@ -149,11 +212,18 @@ class KM3Former(nn.Module):
         src = src * valid_mask
 
         memory = src
+        attention_context = None
+        if self.encoder_layers:
+            attention_context = self.encoder_layers[0].build_attention_context(
+                raw_hits=raw_hits,
+                padding_mask=padding_mask,
+            )
         for encoder_layer in self.encoder_layers:
             memory = encoder_layer(
                 memory,
                 raw_hits=raw_hits,
                 padding_mask=padding_mask,
+                attention_context=attention_context,
             )
             memory = memory * valid_mask
 
@@ -178,11 +248,17 @@ class SparseNeighborhoodEncoderLayer(nn.Module):
         dim_feedforward,
         dropout,
         pairwise_hidden_dim,
-        pairwise_neighbors,
+        time_neighbors,
+        spatial_neighbors,
+        time_neighborhood_mode,
+        time_radius,
         pairwise_time_transform,
         pairwise_distance_transform,
+        pairwise_feature_version,
         exclude_self_from_spatial_knn,
         deduplicate_neighbors,
+        pairwise_position_scale,
+        propagation_speed,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(model_dim)
@@ -191,12 +267,17 @@ class SparseNeighborhoodEncoderLayer(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             pairwise_hidden_dim=pairwise_hidden_dim,
-            time_neighbors=pairwise_neighbors,
-            spatial_neighbors=pairwise_neighbors,
+            time_neighbors=time_neighbors,
+            spatial_neighbors=spatial_neighbors,
+            time_neighborhood_mode=time_neighborhood_mode,
+            time_radius=time_radius,
             pairwise_time_transform=pairwise_time_transform,
             pairwise_distance_transform=pairwise_distance_transform,
+            pairwise_feature_version=pairwise_feature_version,
             exclude_self_from_spatial_knn=exclude_self_from_spatial_knn,
             deduplicate_neighbors=deduplicate_neighbors,
+            pairwise_position_scale=pairwise_position_scale,
+            propagation_speed=propagation_speed,
         )
         self.dropout1 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(model_dim)
@@ -205,12 +286,19 @@ class SparseNeighborhoodEncoderLayer(nn.Module):
         self.linear2 = nn.Linear(dim_feedforward, model_dim)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, src, raw_hits, padding_mask):
+    def build_attention_context(self, raw_hits, padding_mask):
+        return self.self_attention.build_attention_context(
+            raw_hits=raw_hits,
+            padding_mask=padding_mask,
+        )
+
+    def forward(self, src, raw_hits, padding_mask, attention_context=None):
         src = src + self.dropout1(
             self.self_attention(
                 self.norm1(src),
                 raw_hits=raw_hits,
                 padding_mask=padding_mask,
+                attention_context=attention_context,
             )
         )
         src = src + self._feed_forward_block(self.norm2(src))
@@ -234,14 +322,27 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         time_neighbors=32,
         spatial_neighbors=32,
         spatial_chunk_size=64,
+        time_neighborhood_mode="index_window",
+        time_radius=None,
         pairwise_time_transform="raw",
         pairwise_distance_transform="raw",
+        pairwise_feature_version="v1",
         exclude_self_from_spatial_knn=False,
         deduplicate_neighbors=False,
+        pairwise_position_scale=1.0,
+        propagation_speed=DEFAULT_PROPAGATION_SPEED,
     ):
         super().__init__()
         if model_dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads.")
+        if time_neighborhood_mode not in {"index_window", "delta_t_radius"}:
+            raise ValueError(
+                f"Unsupported time_neighborhood_mode: {time_neighborhood_mode!r}"
+            )
+        if time_neighborhood_mode == "delta_t_radius" and time_radius is None:
+            raise ValueError(
+                "time_radius must be provided when using delta_t_radius neighborhoods."
+            )
 
         self.model_dim = model_dim
         self.num_heads = num_heads
@@ -249,6 +350,8 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         self.time_neighbors = time_neighbors
         self.spatial_neighbors = spatial_neighbors
         self.spatial_chunk_size = spatial_chunk_size
+        self.time_neighborhood_mode = time_neighborhood_mode
+        self.time_radius = time_radius
         self.exclude_self_from_spatial_knn = exclude_self_from_spatial_knn
         self.deduplicate_neighbors = deduplicate_neighbors
 
@@ -262,14 +365,40 @@ class SparseNeighborhoodSelfAttention(nn.Module):
             hidden_dim=pairwise_hidden_dim,
             time_transform=pairwise_time_transform,
             distance_transform=pairwise_distance_transform,
+            feature_version=pairwise_feature_version,
+            position_scale=pairwise_position_scale,
+            propagation_speed=propagation_speed,
         )
 
-    def forward(self, hidden_states, raw_hits, padding_mask=None):
-        batch_size, num_hits, _ = hidden_states.shape
+    def build_attention_context(self, raw_hits, padding_mask=None):
         neighbor_indices, neighbor_mask = self.build_neighborhood_indices(
             raw_hits=raw_hits,
             padding_mask=padding_mask,
         )
+        return {
+            "neighbor_indices": neighbor_indices,
+            "neighbor_mask": neighbor_mask,
+            "pair_features": self.pairwise_bias.build_pair_features(
+                raw_hits=raw_hits,
+                neighbor_indices=neighbor_indices,
+            ),
+        }
+
+    def forward(
+        self,
+        hidden_states,
+        raw_hits,
+        padding_mask=None,
+        attention_context=None,
+    ):
+        batch_size, num_hits, _ = hidden_states.shape
+        if attention_context is None:
+            attention_context = self.build_attention_context(
+                raw_hits=raw_hits,
+                padding_mask=padding_mask,
+            )
+        neighbor_indices = attention_context["neighbor_indices"]
+        neighbor_mask = attention_context["neighbor_mask"]
         query_valid = self._get_query_valid_mask(
             batch_size=batch_size,
             num_hits=num_hits,
@@ -288,7 +417,9 @@ class SparseNeighborhoodSelfAttention(nn.Module):
             torch.sum(query.unsqueeze(-2) * gathered_key, dim=-1)
             / math.sqrt(self.head_dim)
         )
-        logits = logits + self.pairwise_bias(raw_hits, neighbor_indices)
+        logits = logits + self.pairwise_bias(
+            pair_features=attention_context["pair_features"]
+        )
 
         attention_mask = neighbor_mask.unsqueeze(1)
         logits = logits.masked_fill(~attention_mask, -1e9)
@@ -321,11 +452,14 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         batch_size, num_hits, _ = raw_hits.shape
         device = raw_hits.device
 
-        time_indices, time_mask = self._build_time_window_indices(
-            batch_size=batch_size,
-            num_hits=num_hits,
-            device=device,
-        )
+        if self.time_neighborhood_mode == "delta_t_radius":
+            time_indices, time_mask = self._build_delta_t_radius_indices(raw_hits)
+        else:
+            time_indices, time_mask = self._build_time_window_indices(
+                batch_size=batch_size,
+                num_hits=num_hits,
+                device=device,
+            )
         spatial_indices, spatial_mask = self._build_spatial_knn_indices(
             raw_hits=raw_hits,
             padding_mask=padding_mask,
@@ -366,6 +500,18 @@ class SparseNeighborhoodSelfAttention(nn.Module):
         )
         window_mask = window_mask.expand(batch_size, -1, -1)
         return window_indices, window_mask
+
+    def _build_delta_t_radius_indices(self, raw_hits):
+        batch_size, num_hits, _ = raw_hits.shape
+        device = raw_hits.device
+        hit_indices = torch.arange(num_hits, device=device).view(1, 1, num_hits).expand(
+            batch_size,
+            num_hits,
+            -1,
+        )
+        hit_times = raw_hits[..., 0]
+        delta_t = hit_times.unsqueeze(-1) - hit_times.unsqueeze(-2)
+        return hit_indices, delta_t.abs() <= self.time_radius
 
     def _build_spatial_knn_indices(self, raw_hits, padding_mask=None):
         batch_size, num_hits, _ = raw_hits.shape
@@ -485,6 +631,38 @@ class AttentionMeanConcatPooling(nn.Module):
         return torch.cat([attention_summary, mean_summary], dim=-1)
 
 
+class AttentionMeanSumCountConcatPooling(nn.Module):
+    def __init__(self, model_dim):
+        super().__init__()
+        self.attention_pool = MaskedAttentionPooling(model_dim=model_dim)
+        self.mean_pool = MaskedMeanPooling()
+
+    def forward(self, memory, padding_mask=None):
+        attention_summary = self.attention_pool(memory, padding_mask=padding_mask)
+        mean_summary = self.mean_pool(memory, padding_mask=padding_mask)
+        if padding_mask is None:
+            sum_summary = memory.sum(dim=1)
+            valid_counts = torch.full(
+                (memory.size(0), 1),
+                memory.size(1),
+                dtype=memory.dtype,
+                device=memory.device,
+            )
+        else:
+            valid_mask = (~padding_mask).unsqueeze(-1).to(dtype=memory.dtype)
+            sum_summary = (memory * valid_mask).sum(dim=1)
+            valid_counts = valid_mask.sum(dim=1)
+        return torch.cat(
+            [
+                attention_summary,
+                mean_summary,
+                sum_summary,
+                torch.log1p(valid_counts.clamp(min=0.0)),
+            ],
+            dim=-1,
+        )
+
+
 class PairwiseAttentionBias(nn.Module):
     def __init__(
         self,
@@ -492,6 +670,9 @@ class PairwiseAttentionBias(nn.Module):
         hidden_dim,
         time_transform="raw",
         distance_transform="raw",
+        feature_version="v1",
+        position_scale=1.0,
+        propagation_speed=DEFAULT_PROPAGATION_SPEED,
     ):
         super().__init__()
         if time_transform not in {"raw", "signed_log1p"}:
@@ -500,15 +681,24 @@ class PairwiseAttentionBias(nn.Module):
             raise ValueError(
                 f"Unsupported distance_transform: {distance_transform!r}"
             )
+        if feature_version not in {"v1", "v2_physics"}:
+            raise ValueError(f"Unsupported feature_version: {feature_version!r}")
+        if position_scale <= 0.0:
+            raise ValueError("position_scale must be positive.")
+        if propagation_speed <= 0.0:
+            raise ValueError("propagation_speed must be positive.")
         self.time_transform = time_transform
         self.distance_transform = distance_transform
+        self.feature_version = feature_version
+        self.position_scale = float(position_scale)
+        self.propagation_speed = float(propagation_speed)
         self.bias_mlp = nn.Sequential(
-            nn.Linear(8, hidden_dim),
+            nn.Linear(8 if feature_version == "v1" else 13, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_heads),
         )
 
-    def forward(self, raw_hits, neighbor_indices):
+    def build_pair_features(self, raw_hits, neighbor_indices):
         neighbor_hits = gather_hit_neighbors(raw_hits, neighbor_indices)
 
         source_times = raw_hits[..., 0].unsqueeze(-1)
@@ -540,20 +730,60 @@ class PairwiseAttentionBias(nn.Module):
         orientation_source = (source_directions * direction_to_neighbor).sum(dim=-1)
         orientation_target = (target_directions * -direction_to_neighbor).sum(dim=-1)
 
-        pair_features = torch.stack(
-            [
-                signed_delta_t,
-                delta_t_magnitude,
-                delta_pos[..., 0],
-                delta_pos[..., 1],
-                delta_pos[..., 2],
-                distance_feature,
-                orientation_source,
-                orientation_target,
-            ],
-            dim=-1,
-        )
+        pair_features = [
+            signed_delta_t,
+            delta_t_magnitude,
+            delta_pos[..., 0],
+            delta_pos[..., 1],
+            delta_pos[..., 2],
+            distance_feature,
+            orientation_source,
+            orientation_target,
+        ]
+        if self.feature_version == "v2_physics":
+            physical_delta_pos = delta_pos * self.position_scale
+            physical_distance = torch.linalg.norm(physical_delta_pos, dim=-1)
+            causal_residual = delta_t - (
+                physical_distance / self.propagation_speed
+            )
+            source_log_tot = raw_hits[..., TOT_FEATURE_INDEX].unsqueeze(-1).expand_as(
+                delta_t
+            )
+            target_log_tot = neighbor_hits[..., TOT_FEATURE_INDEX]
+            pair_features.extend(
+                [
+                    causal_residual,
+                    causal_residual.abs(),
+                    source_log_tot,
+                    target_log_tot,
+                    source_log_tot - target_log_tot,
+                ]
+            )
+        return torch.stack(pair_features, dim=-1)
+
+    def forward(self, raw_hits=None, neighbor_indices=None, pair_features=None):
+        if pair_features is None:
+            if raw_hits is None or neighbor_indices is None:
+                raise ValueError(
+                    "PairwiseAttentionBias.forward requires pair_features or both raw_hits and neighbor_indices."
+                )
+            pair_features = self.build_pair_features(
+                raw_hits=raw_hits,
+                neighbor_indices=neighbor_indices,
+            )
         return self.bias_mlp(pair_features).permute(0, 3, 1, 2)
+
+
+class CoralOrdinalHead(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError("Ordinal classification requires at least two classes.")
+        self.score = nn.Linear(input_dim, 1)
+        self.bias = nn.Parameter(torch.zeros(num_classes - 1))
+
+    def forward(self, inputs):
+        return self.score(inputs) + self.bias.view(1, -1)
 
 
 class NoOpPositionalEncoding(nn.Module):

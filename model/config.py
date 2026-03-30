@@ -15,12 +15,19 @@ DEFAULT_TRAIN_CONFIG = {
         "dim_feedforward": 512,
         "dropout": 0.1,
         "pairwise_neighbors": 32,
+        "time_neighbors": None,
+        "spatial_neighbors": None,
         "position_encoding": "sinusoidal",
+        "time_neighborhood_mode": "index_window",
+        "time_radius": None,
         "pairwise_time_transform": "raw",
         "pairwise_distance_transform": "raw",
+        "pairwise_feature_version": "v1",
         "exclude_self_from_spatial_knn": False,
         "deduplicate_neighbors": False,
         "pooling": "attention",
+        "count_head": "multiclass",
+        "propagation_speed": 0.225,
     },
     "training": {
         "batch_size": 64,
@@ -73,6 +80,7 @@ def resolve_train_config(config_path=None, overrides=None):
 def get_model_init_kwargs(metadata, resolved_config):
     # Model hyperparameters come from config, while tensor shape comes from metadata.
     model_config = resolved_config["model"]
+    normalization_metadata = metadata.get("normalization", {})
     return {
         "input_dim": metadata["input_dim"],
         "target_dim": metadata.get("target_dim", 3),
@@ -84,12 +92,26 @@ def get_model_init_kwargs(metadata, resolved_config):
         "dropout": model_config["dropout"],
         "max_hits": metadata["max_hits"],
         "pairwise_neighbors": model_config["pairwise_neighbors"],
+        "time_neighbors": model_config.get("time_neighbors"),
+        "spatial_neighbors": model_config.get("spatial_neighbors"),
         "position_encoding": model_config["position_encoding"],
+        "time_neighborhood_mode": model_config.get(
+            "time_neighborhood_mode",
+            "index_window",
+        ),
+        "time_radius": model_config.get("time_radius"),
         "pairwise_time_transform": model_config["pairwise_time_transform"],
         "pairwise_distance_transform": model_config["pairwise_distance_transform"],
+        "pairwise_feature_version": model_config.get(
+            "pairwise_feature_version",
+            "v1",
+        ),
         "exclude_self_from_spatial_knn": model_config["exclude_self_from_spatial_knn"],
         "deduplicate_neighbors": model_config["deduplicate_neighbors"],
         "pooling": model_config["pooling"],
+        "count_head": model_config.get("count_head", "multiclass"),
+        "pairwise_position_scale": normalization_metadata.get("position_scale", 1.0),
+        "propagation_speed": model_config.get("propagation_speed", 0.225),
     }
 
 
