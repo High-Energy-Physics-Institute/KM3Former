@@ -7,7 +7,7 @@ Rewrite the experiment plan so it matches the code that is actually present in t
 This repository already supports two preprocessing paths:
 
 - ROOT -> `direction` regression
-- HDF5 -> `muon_count` multiclass classification
+- HDF5 -> `muon_count` count classification with multiclass or ordinal heads
 
 For this experiment we use the HDF5 path and the HDF5 file that already exists in the repo:
 
@@ -16,6 +16,8 @@ For this experiment we use the HDF5 path and the HDF5 file that already exists i
 The target task is:
 
 - `muon_count`
+
+The saved labels remain scalar class indices `0`, `1`, and `2`. The head can stay plain multiclass or switch to `count_head = "ordinal_coral"` without regenerating preprocessing outputs.
 
 ## Repository Alignment
 
@@ -68,6 +70,12 @@ The label values in `mc_muons[:, 0]` are balanced and currently map to:
 
 Each class has `7185` examples.
 
+Important modeling note:
+
+- `target_kind` remains `multiclass`
+- `count_head = "multiclass"` predicts class logits
+- `count_head = "ordinal_coral"` predicts threshold logits and is converted back into class probabilities during evaluation and inference
+
 ## Experiment Flow
 
 The experiment should be run in four stages:
@@ -93,6 +101,8 @@ Recommended run naming:
 - `runs/muon_count_mac_m4/exp_001_baseline`
 - `runs/muon_count_mac_m4/exp_002_model_dim_256`
 - `runs/muon_count_mac_m4/exp_003_more_epochs`
+- `runs/muon_count_mac_m4/exp_004_delta_t_radius_v2`
+- `runs/muon_count_mac_m4/exp_005_ordinal_coral`
 
 Each experiment directory should collect at least:
 
@@ -217,7 +227,11 @@ For a cleaner local experiment, use a dedicated config such as `configs/train.mu
     "num_encoder_layers": 4,
     "dim_feedforward": 256,
     "dropout": 0.1,
-    "pairwise_neighbors": 16
+    "pairwise_neighbors": 16,
+    "position_encoding": "none",
+    "exclude_self_from_spatial_knn": true,
+    "deduplicate_neighbors": true,
+    "pooling": "attention_mean_sum_count_concat"
   },
   "training": {
     "batch_size": 32,
@@ -237,8 +251,19 @@ Why this is suitable for the local Mac M4 setup:
 - it avoids mixing checkpoints with source files
 - it remains fully compatible with `model/train.py`
 - the smaller model is more practical for CPU training on macOS
+- it uses the current safer `muon_count` defaults: no positional encoding, deduplicated sparse neighbors, and count-aware pooling
 
 The config gives a Mac-friendly baseline, but each experiment should still use its own `model_path` so outputs are tracked separately.
+
+Advanced knobs that now exist in the repo and can be added for follow-up experiments:
+
+- `time_neighbors`
+- `spatial_neighbors`
+- `time_neighborhood_mode`
+- `time_radius`
+- `pairwise_feature_version`
+- `count_head`
+- `propagation_speed`
 
 ## 4. Train The Muon Count Model
 
@@ -254,7 +279,7 @@ This command will:
 
 - read `data/metadata.json`
 - detect `task = muon_count`
-- build a multiclass model head using `target_dim` from metadata
+- build a `muon_count` head using `target_dim` from metadata and `count_head` from config
 - load `train`, `val`, and `test` tensors from `data/`
 - train and save checkpoints
 
@@ -301,6 +326,8 @@ For this `muon_count` task, the inference payload should contain:
 - `probabilities`
 - `predicted_classes`
 - `predicted_labels`
+- `confidence`
+- `threshold_logits` when `count_head = ordinal_coral`
 - `task = muon_count`
 - `target_kind = multiclass`
 
@@ -321,6 +348,8 @@ Examples:
 - baseline: `./runs/muon_count_mac_m4/exp_001_baseline`
 - changed model size: `./runs/muon_count_mac_m4/exp_002_model_dim_256`
 - changed training length: `./runs/muon_count_mac_m4/exp_003_epochs_20`
+- changed time neighborhood and pair bias: `./runs/muon_count_mac_m4/exp_004_delta_t_radius_v2`
+- changed count head: `./runs/muon_count_mac_m4/exp_005_ordinal_coral`
 
 This is the part that keeps a track of changes across experiments: every run remains self-contained and reviewable.
 
@@ -350,11 +379,11 @@ This repository should be documented as an HDF5-based `muon_count` experiment on
 The program should no longer describe nonexistent filenames or a generic template pipeline. It should describe the real repo flow and preserve outputs between experiments:
 
 1. preprocess `data/muon_data_7224_7247.h5` into split tensors in `data/`
-2. train KM3Former for `muon_count`
+2. train KM3Former for `muon_count` with either the legacy multiclass head or the ordinal CORAL head
 3. save each experiment under its own run directory
 4. collect checkpoint, config, metadata snapshot, and predictions for later comparison
 5. append a short summary entry to `results.md`
-6. infer on the test split and keep the predictions with the same experiment artifacts
+6. infer on the test split and keep the predictions, probabilities, and optional ordinal threshold logits with the same experiment artifacts
 
 ## Colab Fast Ablation Wave
 
@@ -370,6 +399,7 @@ Experiment-specific overrides live in:
 - `configs/experiments/exp_005_pairbias_dedup.json`
 - `configs/experiments/exp_006_no_posenc.json`
 - `configs/experiments/exp_007_pooling_upgrade.json`
+- `configs/experiments/exp_008_capacity_push.json`
 
 The detailed Colab instructions for ephemeral `/content` runs are documented in:
 
@@ -382,3 +412,9 @@ New experiment outputs now include:
 - `test_predictions.pt`
 
 For the ablation ladder, prefer validation macro-F1 and class-`1` recall as the main promotion signal, and use test accuracy as a secondary comparison metric.
+
+The next model-specific comparisons should be:
+
+- baseline sparse index-window attention versus `time_neighborhood_mode = "delta_t_radius"`
+- `pairwise_feature_version = "v1"` versus `pairwise_feature_version = "v2_physics"`
+- `count_head = "multiclass"` versus `count_head = "ordinal_coral"`

@@ -3,7 +3,7 @@
 KM3Former is a transformer-based pipeline for KM3NeT-style event reconstruction. The repository currently supports two end-to-end workflows:
 
 - ROOT -> `direction` vector regression
-- HDF5 -> `muon_count` multiclass classification
+- HDF5 -> `muon_count` count classification with multiclass or ordinal heads
 
 The codebase covers preprocessing, saved tensor datasets, training, inference, and basic regression tests.
 
@@ -88,17 +88,18 @@ This path produces normalized truth direction vectors and can optionally supervi
 
 ### 2. HDF5 -> `muon_count`
 
-The newer preprocessing path reads HDF5 detector events and builds multiclass muon-count targets.
+The newer preprocessing path reads HDF5 detector events and builds ordered muon-count targets.
 
 - source format: `hdf5`
 - task: `muon_count`
 - target kind: `multiclass`
 - target dimension: number of classes, not scalar target width
 
-Important detail:
+Important details:
 
 - each event target is still a single scalar class index in `*_targets.pt`
 - `target_dim` is the number of output classes the classifier predicts
+- the training target stays `multiclass`, while the model head can be plain multiclass logits or `ordinal_coral`
 
 For the checked-in HDF5 dataset used in local experiments, the current classes are:
 
@@ -191,18 +192,21 @@ The loader supports `lazy` and `eager` loading and validates that all saved tens
 High-level characteristics:
 
 - hit tokens are embedded with a small MLP
-- sinusoidal positional encoding is applied over hit order
+- positional encoding is configurable; the maintained `muon_count` configs now use `none`
 - attention uses sparse local neighborhoods instead of full dense self-attention
-- pairwise geometry/time features contribute learned attention bias
-- masked attention pooling summarizes an event
+- local neighborhoods are built once per forward pass and reused across encoder layers
+- time neighborhoods can be index-window or `delta_t_radius`
+- pairwise geometry/time features contribute learned attention bias through `v1` or `v2_physics` feature sets
+- pooling can be `attention`, `attention_mean_concat`, or `attention_mean_sum_count_concat`
 - the final head is task-aware through `target_kind`
 
 Outputs:
 
 - `direction`: normalized 3D direction vector, with optional quality head
-- `muon_count`: class logits of shape `[batch, num_classes]`
+- `muon_count` with `count_head = "multiclass"`: class logits of shape `[batch, num_classes]`
+- `muon_count` with `count_head = "ordinal_coral"`: threshold logits of shape `[batch, num_classes - 1]`
 
-The quality head is only active for `direction`. It is not used for `muon_count`.
+The quality head is only active for `direction`. For `muon_count`, training and inference always expose class probabilities and predicted classes; ordinal runs additionally expose `threshold_logits` and `confidence`.
 
 ## Training
 
@@ -218,7 +222,6 @@ Options:
 
 - `--config`
 - `--data-path`
-- `--model-path`
 - `--model-path`
 
 Default training config lives in [train.default.json](/Users/djaz89/projects/KM3Former/configs/train.default.json):
@@ -236,12 +239,19 @@ Default training config lives in [train.default.json](/Users/djaz89/projects/KM3
     "dim_feedforward": 512,
     "dropout": 0.1,
     "pairwise_neighbors": 32,
+    "time_neighbors": null,
+    "spatial_neighbors": null,
     "position_encoding": "sinusoidal",
+    "time_neighborhood_mode": "index_window",
+    "time_radius": null,
     "pairwise_time_transform": "raw",
     "pairwise_distance_transform": "raw",
+    "pairwise_feature_version": "v1",
     "exclude_self_from_spatial_knn": false,
     "deduplicate_neighbors": false,
-    "pooling": "attention"
+    "pooling": "attention",
+    "count_head": "multiclass",
+    "propagation_speed": 0.225
   },
   "training": {
     "batch_size": 64,
@@ -301,6 +311,8 @@ For `muon_count`, the output payload includes:
 - `probabilities`
 - `predicted_classes`
 - `predicted_labels`
+- `confidence`
+- `threshold_logits` for ordinal runs
 - `targets` when available
 - `metrics` when targets are available
 - `task`
@@ -339,6 +351,10 @@ It uses:
 - `num_encoder_layers = 4`
 - `dim_feedforward = 256`
 - `pairwise_neighbors = 16`
+- `position_encoding = none`
+- `exclude_self_from_spatial_knn = true`
+- `deduplicate_neighbors = true`
+- `pooling = attention_mean_sum_count_concat`
 - `batch_size = 32`
 - `epochs = 1`
 - `model_path = ./runs/muon_count_smoke`
@@ -437,12 +453,13 @@ The fast ablation configs live under:
 - [exp_005_pairbias_dedup.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_005_pairbias_dedup.json)
 - [exp_006_no_posenc.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_006_no_posenc.json)
 - [exp_007_pooling_upgrade.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_007_pooling_upgrade.json)
+- [exp_008_capacity_push.json](/Users/djaz89/projects/KM3Former/configs/experiments/exp_008_capacity_push.json)
 
 The detailed ephemeral Colab workflow is documented in [colab_muon_count_runbook.md](/Users/djaz89/projects/KM3Former/docs/colab_muon_count_runbook.md) and is aligned with [KM3Former.ipynb](/Users/djaz89/projects/KM3Former/KM3Former.ipynb).
 
 ## Next Useful Experiments
 
-- run the same `muon_count` setup for more epochs before changing architecture
-- compare the smoke config against the larger default config
-- inspect class-1 confusion in more detail
-- start saving each experiment under its own run directory for clean comparisons
+- compare `count_head = multiclass` against `count_head = ordinal_coral` on the same split
+- benchmark `delta_t_radius` plus `pairwise_feature_version = v2_physics` against the current default sparse path
+- inspect class-`1` confusion in more detail
+- keep saving each experiment under its own run directory for clean comparisons
