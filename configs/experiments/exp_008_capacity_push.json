@@ -1,26 +1,36 @@
 {
-  "paths": {
-    "model_path": "./runs/exp_008_capacity_push"
+  "loader": {
+    "eval_max_workers": 2,
+    "train_max_workers": 2
   },
   "model": {
-    "model_dim": 192,
-    "num_heads": 8,
-    "num_encoder_layers": 4,
+    "count_head": "multiclass",
+    "deduplicate_neighbors": true,
     "dim_feedforward": 384,
     "dropout": 0.1,
-    "pairwise_neighbors": 16,
-    "position_encoding": "none",
     "exclude_self_from_spatial_knn": true,
-    "deduplicate_neighbors": true,
-    "pooling": "attention_mean_sum_count_concat"
+    "model_dim": 192,
+    "num_encoder_layers": 4,
+    "num_heads": 8,
+    "pairwise_distance_transform": "raw",
+    "pairwise_feature_version": "v1",
+    "pairwise_neighbors": 16,
+    "pairwise_time_transform": "raw",
+    "pooling": "attention_mean_sum_count_concat",
+    "position_encoding": "none",
+    "propagation_speed": 0.225,
+    "spatial_neighbors": null,
+    "time_neighborhood_mode": "index_window",
+    "time_neighbors": null,
+    "time_radius": null
+  },
+  "paths": {
+    "data_path": "./data",
+    "model_path": "./runs/exp_008_capacity_push"
   },
   "training": {
-    "batch_size": 48,
-    "learning_rate": 0.0008,
-    "epochs": 10
-  },
-  "loader": {
-    "train_max_workers": 2,
-    "eval_max_workers": 2
+    "batch_size": 32,
+    "epochs": 10,
+    "learning_rate": 0.0008
   }
 }

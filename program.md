@@ -400,6 +400,7 @@ Experiment-specific overrides live in:
 - `configs/experiments/exp_006_no_posenc.json`
 - `configs/experiments/exp_007_pooling_upgrade.json`
 - `configs/experiments/exp_008_capacity_push.json`
+- `configs/experiments/exp_009_capacity_push_retuned.json`
 
 The detailed Colab instructions for ephemeral `/content` runs are documented in:
 
@@ -412,6 +413,8 @@ New experiment outputs now include:
 - `test_predictions.pt`
 
 For the ablation ladder, prefer validation macro-F1 and class-`1` recall as the main promotion signal, and use test accuracy as a secondary comparison metric.
+
+`exp_009_capacity_push_retuned` is the direct follow-up to `exp_008_capacity_push`: keep the larger `192`-dim capacity and `batch_size = 32`, restore `signed_log1p` / `log1p` pairwise transforms, and extend training to `15` epochs to test whether the class-`1` plateau was caused more by feature encoding than by capacity.
 
 The next model-specific comparisons should be:
 

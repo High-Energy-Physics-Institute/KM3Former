@@ -1,0 +1,28 @@
+{
+  "paths": {
+    "model_path": "./runs/exp_009_capacity_push_retuned"
+  },
+  "model": {
+    "model_dim": 192,
+    "num_heads": 8,
+    "num_encoder_layers": 4,
+    "dim_feedforward": 384,
+    "dropout": 0.1,
+    "pairwise_neighbors": 16,
+    "position_encoding": "none",
+    "pairwise_time_transform": "signed_log1p",
+    "pairwise_distance_transform": "log1p",
+    "exclude_self_from_spatial_knn": true,
+    "deduplicate_neighbors": true,
+    "pooling": "attention_mean_sum_count_concat"
+  },
+  "training": {
+    "batch_size": 32,
+    "learning_rate": 0.0008,
+    "epochs": 15
+  },
+  "loader": {
+    "train_max_workers": 2,
+    "eval_max_workers": 2
+  }
+}
