@@ -1,5 +1,11 @@
 # Results
 
+## detector_overlap_analysis_summary
+
+Follow-up analysis in `runs/detector_overlap_analysis` indicates that the main bottleneck is detector-response overlap rather than a purely architectural failure: true class `1` events behave like a continuum between lower-activity class `0` events and higher-activity class `2` events when viewed through detector-observable features such as `active_hits` and `total_tot`. Detector-only cheap baselines reached about `0.484` to `0.485` test accuracy with class-`1` recall only `0.243` to `0.286`, while KM3Former improved to about `0.532` to `0.539` accuracy but still kept class `1` as the limiting factor.
+
+The ambiguity diagnostics strengthen that conclusion: for both `exp_008_capacity_push` and `exp_009_capacity_push_retuned`, the model was least confident when it predicted class `1` correctly and more confident when true class `1` events were pushed toward class `0` or class `2`. Important caveat: the MC-truth energy comparison in `runs/detector_overlap_analysis` was used only as a diagnostic sanity check and is not available at real inference time; the operational verdict should therefore be based on detector-only baselines plus KM3Former, not on MC-augmented numbers.
+
 ## exp_001_baseline_local_smoke
 
 Commit `4cec1d0`; used `data/muon_data_7224_7247.h5` with 21,555 events split into 17,244 train / 2,155 val / 2,156 test, and kept the baseline smoke setup in `runs/muon_count_smoke` (`model_dim=128`, `num_heads=4`, `num_encoder_layers=4`, `dim_feedforward=256`, `pairwise_neighbors=16`, `batch_size=32`, `epochs=1`, CPU). Best validation loss was `0.986383` and test accuracy was `0.502319`; confusion matrix (true rows, predicted cols) was `[[439, 140, 126], [309, 157, 233], [138, 127, 487]]`, so this is a usable baseline to keep. Initial note: the model already learned nontrivial structure after one epoch, but class `1` was the main weakness and was frequently confused with classes `0` and `2`.
