@@ -1,0 +1,375 @@
+{
+  "logistic_detector": {
+    "feature_columns": [
+      "active_hits",
+      "active_hit_fraction",
+      "total_tot",
+      "mean_tot_active",
+      "max_tot_active",
+      "time_span",
+      "z_span",
+      "z_mean",
+      "radius_mean",
+      "radius_std",
+      "hit_dir_z_mean",
+      "hit_dir_z_std"
+    ],
+    "feature_type": "detector_only",
+    "split_metrics": {
+      "test": {
+        "accuracy": 0.4837662337662338,
+        "confusion_matrix": [
+          [
+            451,
+            168,
+            86
+          ],
+          [
+            332,
+            170,
+            197
+          ],
+          [
+            152,
+            178,
+            422
+          ]
+        ],
+        "mean_confidence": 0.48783010583977043,
+        "normalized_confusion_matrix": [
+          [
+            0.6397163120567376,
+            0.23829787234042554,
+            0.12198581560283688
+          ],
+          [
+            0.474964234620887,
+            0.24320457796852646,
+            0.28183118741058655
+          ],
+          [
+            0.20212765957446807,
+            0.23670212765957446,
+            0.5611702127659575
+          ]
+        ],
+        "per_class_recall": {
+          "0": {
+            "recall": 0.6397163120567376,
+            "support": 705
+          },
+          "1": {
+            "recall": 0.24320457796852646,
+            "support": 699
+          },
+          "2": {
+            "recall": 0.5611702127659575,
+            "support": 752
+          }
+        }
+      },
+      "val": {
+        "accuracy": 0.4835266821345708,
+        "confusion_matrix": [
+          [
+            459,
+            167,
+            98
+          ],
+          [
+            336,
+            175,
+            188
+          ],
+          [
+            182,
+            142,
+            408
+          ]
+        ],
+        "mean_confidence": 0.48426966585225556,
+        "normalized_confusion_matrix": [
+          [
+            0.6339779005524862,
+            0.23066298342541436,
+            0.13535911602209943
+          ],
+          [
+            0.48068669527896996,
+            0.2503576537911302,
+            0.26895565092989987
+          ],
+          [
+            0.24863387978142076,
+            0.19398907103825136,
+            0.5573770491803278
+          ]
+        ],
+        "per_class_recall": {
+          "0": {
+            "recall": 0.6339779005524862,
+            "support": 724
+          },
+          "1": {
+            "recall": 0.2503576537911302,
+            "support": 699
+          },
+          "2": {
+            "recall": 0.5573770491803278,
+            "support": 732
+          }
+        }
+      }
+    }
+  },
+  "logistic_detector_plus_mc_diagnostic": {
+    "feature_columns": [
+      "active_hits",
+      "active_hit_fraction",
+      "total_tot",
+      "mean_tot_active",
+      "max_tot_active",
+      "time_span",
+      "z_span",
+      "z_mean",
+      "radius_mean",
+      "radius_std",
+      "hit_dir_z_mean",
+      "hit_dir_z_std",
+      "primary_energy_mc",
+      "secondary_energy_mc",
+      "total_energy_mc",
+      "primary_off_vertical_deg_mc"
+    ],
+    "feature_type": "detector_plus_mc_truth_diagnostic_only",
+    "split_metrics": {
+      "test": {
+        "accuracy": 0.75139146567718,
+        "confusion_matrix": [
+          [
+            704,
+            0,
+            1
+          ],
+          [
+            132,
+            447,
+            120
+          ],
+          [
+            5,
+            278,
+            469
+          ]
+        ],
+        "mean_confidence": 0.7010664963586148,
+        "normalized_confusion_matrix": [
+          [
+            0.9985815602836879,
+            0.0,
+            0.0014184397163120568
+          ],
+          [
+            0.1888412017167382,
+            0.6394849785407726,
+            0.17167381974248927
+          ],
+          [
+            0.006648936170212766,
+            0.3696808510638298,
+            0.6236702127659575
+          ]
+        ],
+        "per_class_recall": {
+          "0": {
+            "recall": 0.9985815602836879,
+            "support": 705
+          },
+          "1": {
+            "recall": 0.6394849785407726,
+            "support": 699
+          },
+          "2": {
+            "recall": 0.6236702127659575,
+            "support": 752
+          }
+        }
+      },
+      "val": {
+        "accuracy": 0.7531322505800464,
+        "confusion_matrix": [
+          [
+            724,
+            0,
+            0
+          ],
+          [
+            143,
+            448,
+            108
+          ],
+          [
+            12,
+            269,
+            451
+          ]
+        ],
+        "mean_confidence": 0.7046339916077726,
+        "normalized_confusion_matrix": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.20457796852646637,
+            0.6409155937052933,
+            0.15450643776824036
+          ],
+          [
+            0.01639344262295082,
+            0.3674863387978142,
+            0.6161202185792349
+          ]
+        ],
+        "per_class_recall": {
+          "0": {
+            "recall": 1.0,
+            "support": 724
+          },
+          "1": {
+            "recall": 0.6409155937052933,
+            "support": 699
+          },
+          "2": {
+            "recall": 0.6161202185792349,
+            "support": 732
+          }
+        }
+      }
+    }
+  },
+  "random_forest_detector": {
+    "feature_columns": [
+      "active_hits",
+      "active_hit_fraction",
+      "total_tot",
+      "mean_tot_active",
+      "max_tot_active",
+      "time_span",
+      "z_span",
+      "z_mean",
+      "radius_mean",
+      "radius_std",
+      "hit_dir_z_mean",
+      "hit_dir_z_std"
+    ],
+    "feature_type": "detector_only",
+    "split_metrics": {
+      "test": {
+        "accuracy": 0.48515769944341375,
+        "confusion_matrix": [
+          [
+            419,
+            195,
+            91
+          ],
+          [
+            300,
+            200,
+            199
+          ],
+          [
+            160,
+            165,
+            427
+          ]
+        ],
+        "mean_confidence": 0.5074871057371272,
+        "normalized_confusion_matrix": [
+          [
+            0.5943262411347517,
+            0.2765957446808511,
+            0.12907801418439716
+          ],
+          [
+            0.4291845493562232,
+            0.2861230329041488,
+            0.28469241773962806
+          ],
+          [
+            0.2127659574468085,
+            0.21941489361702127,
+            0.5678191489361702
+          ]
+        ],
+        "per_class_recall": {
+          "0": {
+            "recall": 0.5943262411347517,
+            "support": 705
+          },
+          "1": {
+            "recall": 0.2861230329041488,
+            "support": 699
+          },
+          "2": {
+            "recall": 0.5678191489361702,
+            "support": 752
+          }
+        }
+      },
+      "val": {
+        "accuracy": 0.47610208816705335,
+        "confusion_matrix": [
+          [
+            428,
+            200,
+            96
+          ],
+          [
+            313,
+            205,
+            181
+          ],
+          [
+            164,
+            175,
+            393
+          ]
+        ],
+        "mean_confidence": 0.5028936778904229,
+        "normalized_confusion_matrix": [
+          [
+            0.5911602209944752,
+            0.27624309392265195,
+            0.13259668508287292
+          ],
+          [
+            0.44778254649499283,
+            0.2932761087267525,
+            0.25894134477825465
+          ],
+          [
+            0.22404371584699453,
+            0.2390710382513661,
+            0.5368852459016393
+          ]
+        ],
+        "per_class_recall": {
+          "0": {
+            "recall": 0.5911602209944752,
+            "support": 724
+          },
+          "1": {
+            "recall": 0.2932761087267525,
+            "support": 699
+          },
+          "2": {
+            "recall": 0.5368852459016393,
+            "support": 732
+          }
+        }
+      }
+    }
+  }
+}
