@@ -1,0 +1,14 @@
+{
+  "paths": {
+    "model_path": "./runs/exp_003_capacity_match"
+  },
+  "model": {
+    "model_dim": 128,
+    "num_encoder_layers": 4,
+    "dim_feedforward": 256,
+    "pairwise_neighbors": 16
+  },
+  "training": {
+    "batch_size": 32
+  }
+}

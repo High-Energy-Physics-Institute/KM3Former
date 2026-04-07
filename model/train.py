@@ -1,82 +1,462 @@
-import pandas as pd
+import json
+import os
+import sys
+
+import click
 import torch
-import torch.nn as nn
+from config import get_model_init_kwargs, resolve_train_config, save_json_file
 from data_loader import KM3Loader
+from eval import (
+    compute_task_loss,
+    compute_task_metric,
+    evaluate_model,
+    move_batch_dict_to_device,
+    reconstruction_quality_target,
+    resolve_task_settings,
+)
 from km3former import KM3Former
 from scheduler import create_optimizer_and_scheduler
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-DATA_PATH = "./data"
-MODEL_PATH = "./model"
-
-input_dim = 8
-model_dim = 256
-num_heads = 8
-num_encoder_layers = 6
-dim_feedforward = 512
-dropout = 0.1
-batch_size = 256
-
-learning_rate = 8e-4
-epochs = 10
+DEFAULT_RESOLVED_CONFIG_PATH = "resolved_train_config.json"
+DEFAULT_METRICS_PATH = "metrics.json"
 
 
-dataset = KM3Loader(f"{DATA_PATH}/hits.pt", f"{DATA_PATH}/muons.pt")
-data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def build_dataset(split_name, data_path, load_strategy="lazy"):
+    target_file = f"{data_path}/{split_name}_targets.pt"
+    legacy_label_file = f"{data_path}/{split_name}_muons.pt"
+    rec_label_file = f"{data_path}/{split_name}_muons_rec.pt"
+    energy_label_file = f"{data_path}/{split_name}_muons_e.pt"
+    metadata_file = f"{data_path}/metadata.json"
 
-train_steps = len(data_loader) * epochs
-warmup_steps = int(0.05 * train_steps)
+    return KM3Loader(
+        hits_file=f"{data_path}/{split_name}_hits.pt",
+        raw_hits_file=f"{data_path}/{split_name}_hits_raw.pt",
+        padding_mask_file=f"{data_path}/{split_name}_padding_mask.pt",
+        target_file=target_file if os.path.exists(target_file) else None,
+        label_file=legacy_label_file if os.path.exists(legacy_label_file) else None,
+        rec_label_file=rec_label_file if os.path.exists(rec_label_file) else None,
+        energy_label_file=(
+            energy_label_file if os.path.exists(energy_label_file) else None
+        ),
+        metadata_file=metadata_file if os.path.exists(metadata_file) else None,
+        load_strategy=load_strategy,
+    )
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def resolve_quality_supervision(*datasets, metadata=None):
+    task_settings = resolve_task_settings(metadata or {})
+    if not task_settings["supports_quality"]:
+        return False
 
-model = KM3Former(
-    input_dim=input_dim,
-    model_dim=model_dim,
-    num_heads=num_heads,
-    num_encoder_layers=num_encoder_layers,
-    dim_feedforward=dim_feedforward,
-    dropout=dropout,
-).to(device)
-
-
-criterion = nn.MSELoss()
-
-optimizer, lr_scheduler = create_optimizer_and_scheduler(
-    model, train_steps, warmup_steps
-)
-
-writer = SummaryWriter(log_dir=f"{MODEL_PATH}/tensorboard")
-
-model.train()
-
-for epoch in tqdm(range(epochs)):
-    running_loss = 0.0
-    for batch_idx, (hits, muons) in enumerate(tqdm(data_loader)):
-        hits, muons = hits.to(device), muons.to(device)
-
-        optimizer.zero_grad()
-        output = model(hits)
-        loss = criterion(output, muons)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        lr_scheduler.step()
-        running_loss += loss.item()
-
-        writer.add_scalar(
-            "Loss/Train_Batch", loss.item(), epoch * len(data_loader) + batch_idx
+    availability = [dataset.has_rec_labels for dataset in datasets]
+    if any(availability) and not all(availability):
+        raise ValueError(
+            "Reconstructed labels must be present for all train/val/test splits "
+            "or omitted for all of them."
         )
 
-    average_loss = running_loss / len(data_loader)
-    current_lr = lr_scheduler.get_last_lr()[0]
+    return all(availability)
 
-    writer.add_scalar("Loss/Train_Epoch", average_loss, epoch)
-    writer.add_scalar("Learning_Rate", current_lr, epoch)
 
-    torch.save(
-        model.state_dict(),
-        f"{MODEL_PATH}/model_epoch_{epoch+1}.pth",
+def get_default_num_workers(max_workers=4):
+    if sys.platform == "darwin":
+        return 0
+
+    return min(max_workers, os.cpu_count() or 1)
+
+
+def build_data_loader(dataset, batch_size, shuffle, max_workers=4):
+    num_workers = get_default_num_workers(max_workers=max_workers)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def load_metadata(data_path):
+    with open(f"{data_path}/metadata.json", "r", encoding="ascii") as metadata_file:
+        return json.load(metadata_file)
+
+
+def build_model(metadata, resolved_config, device):
+    # Metadata owns tensor shape; config owns architectural hyperparameters.
+    return KM3Former(
+        **get_model_init_kwargs(
+            metadata=metadata,
+            resolved_config=resolved_config,
+        )
+    ).to(device)
+
+
+def get_cli_overrides(data_path=None, model_path=None):
+    overrides = {}
+    if data_path is not None:
+        overrides.setdefault("paths", {})["data_path"] = data_path
+    if model_path is not None:
+        overrides.setdefault("paths", {})["model_path"] = model_path
+    return overrides
+
+
+def build_prediction_artifact(split_name, evaluation, task_settings, metadata):
+    outputs = evaluation["outputs"]
+    payload = {
+        "split": split_name,
+        "task": task_settings["task"],
+        "target_kind": task_settings["target_kind"],
+        "loss": evaluation["loss"],
+        task_settings["metric_name"]: evaluation[task_settings["metric_name"]],
+        "predictions": outputs["predictions"],
+        "targets": outputs["targets"],
+        "summary": evaluation["summary"],
+    }
+    if "quality" in outputs:
+        payload["quality"] = outputs["quality"]
+    if "confidence" in outputs:
+        payload["confidence"] = outputs["confidence"]
+    if task_settings["target_kind"] == "multiclass":
+        payload["probabilities"] = outputs["probabilities"]
+        payload["predicted_classes"] = outputs["predicted_classes"]
+        if "threshold_logits" in outputs:
+            payload["threshold_logits"] = outputs["threshold_logits"]
+        if "class_values" in metadata:
+            class_values = metadata["class_values"]
+            payload["predicted_labels"] = torch.tensor(
+                [class_values[index] for index in outputs["predicted_classes"].tolist()]
+            )
+    return payload
+
+
+def build_metrics_record(evaluation, task_settings):
+    metrics = {
+        "loss": evaluation["loss"],
+        task_settings["metric_name"]: evaluation[task_settings["metric_name"]],
+    }
+    if "summary" in evaluation:
+        metrics.update(evaluation["summary"])
+    return metrics
+
+
+def train_model(resolved_config):
+    from torch.utils.tensorboard import SummaryWriter
+
+    data_path = resolved_config["paths"]["data_path"]
+    model_path = resolved_config["paths"]["model_path"]
+    batch_size = resolved_config["training"]["batch_size"]
+    learning_rate = resolved_config["training"]["learning_rate"]
+    epochs = resolved_config["training"]["epochs"]
+    train_max_workers = resolved_config["loader"]["train_max_workers"]
+    eval_max_workers = resolved_config["loader"]["eval_max_workers"]
+
+    metadata = load_metadata(data_path=data_path)
+    task_settings = resolve_task_settings(
+        metadata,
+        count_head=resolved_config["model"].get("count_head", "multiclass"),
     )
+
+    os.makedirs(model_path, exist_ok=True)
+    # Save the final merged config so each checkpoint directory is self-describing.
+    save_json_file(
+        resolved_config,
+        f"{model_path}/{DEFAULT_RESOLVED_CONFIG_PATH}",
+    )
+
+    train_dataset = build_dataset("train", data_path=data_path)
+    val_dataset = build_dataset("val", data_path=data_path)
+    test_dataset = build_dataset("test", data_path=data_path)
+    quality_supervised = resolve_quality_supervision(
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        metadata=metadata,
+    )
+
+    train_loader = build_data_loader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        max_workers=train_max_workers,
+    )
+    val_loader = build_data_loader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        max_workers=eval_max_workers,
+    )
+    test_loader = build_data_loader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        max_workers=eval_max_workers,
+    )
+
+    train_steps = len(train_loader) * epochs
+    warmup_steps = max(1, int(0.05 * train_steps))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(
+        metadata=metadata,
+        resolved_config=resolved_config,
+        device=device,
+    )
+
+    optimizer, lr_scheduler = create_optimizer_and_scheduler(
+        model=model,
+        train_steps=train_steps,
+        warmup_steps=warmup_steps,
+        learning_rate=learning_rate,
+    )
+
+    writer = SummaryWriter(log_dir=f"{model_path}/tensorboard")
+    best_val_loss = float("inf")
+    model.train()
+
+    epoch_progress = tqdm(
+        range(epochs),
+        desc="Epochs",
+        position=0,
+        leave=True,
+        dynamic_ncols=True,
+        mininterval=0.5,
+    )
+    try:
+        for epoch in epoch_progress:
+            running_loss = 0.0
+            running_metric = 0.0
+            total_batches = len(train_loader)
+
+            batch_progress = tqdm(
+                train_loader,
+                desc=f"Train {epoch + 1}/{epochs}",
+                total=total_batches,
+                position=1,
+                leave=False,
+                dynamic_ncols=True,
+                mininterval=0.5,
+            )
+            try:
+                for batch_idx, batch in enumerate(batch_progress, start=1):
+                    batch = move_batch_dict_to_device(batch, device=device)
+                    hits = batch["hits"]
+                    raw_hits = batch["raw_hits"]
+                    padding_mask = batch["padding_mask"]
+                    target = batch["target"]
+
+                    optimizer.zero_grad()
+                    model_output = model(
+                        hits,
+                        raw_hits=raw_hits,
+                        padding_mask=padding_mask,
+                        return_quality=quality_supervised,
+                    )
+                    if quality_supervised:
+                        prediction, quality = model_output
+                    else:
+                        prediction = model_output
+                        quality = None
+                    quality_target = None
+                    if quality_supervised:
+                        quality_target = reconstruction_quality_target(
+                            batch["rec_muons"],
+                            target,
+                        )
+                    loss = compute_task_loss(
+                        prediction,
+                        target,
+                        task_settings=task_settings,
+                        quality_prediction=quality,
+                        quality_target=quality_target,
+                    )
+                    metric_value = compute_task_metric(
+                        prediction,
+                        target,
+                        task_settings=task_settings,
+                    )
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+
+                    running_loss += loss.item()
+                    running_metric += metric_value.item()
+
+                    global_step = epoch * total_batches + (batch_idx - 1)
+                    writer.add_scalar("Loss/Train_Batch", loss.item(), global_step)
+                    writer.add_scalar(
+                        f"{task_settings['metric_label']}/Train_Batch",
+                        metric_value.item(),
+                        global_step,
+                    )
+
+                    batch_progress.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        metric=f"{metric_value.item():.4f}",
+                        lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                    )
+            finally:
+                batch_progress.close()
+
+            average_train_loss = running_loss / max(total_batches, 1)
+            average_train_metric = running_metric / max(total_batches, 1)
+            val_metrics = evaluate_model(
+                model,
+                val_loader,
+                device=device,
+                task_settings=task_settings,
+                quality_supervised=quality_supervised,
+                class_values=metadata.get("class_values"),
+            )
+            current_lr = lr_scheduler.get_last_lr()[0]
+
+            writer.add_scalar("Loss/Train_Epoch", average_train_loss, epoch)
+            writer.add_scalar(
+                f"{task_settings['metric_label']}/Train_Epoch",
+                average_train_metric,
+                epoch,
+            )
+            writer.add_scalar("Loss/Val_Epoch", val_metrics["loss"], epoch)
+            writer.add_scalar(
+                f"{task_settings['metric_label']}/Val_Epoch",
+                val_metrics[task_settings["metric_name"]],
+                epoch,
+            )
+            writer.add_scalar("Learning_Rate", current_lr, epoch)
+
+            epoch_progress.set_postfix(
+                train_loss=f"{average_train_loss:.4f}",
+                train_metric=f"{average_train_metric:.4f}",
+                val_loss=f"{val_metrics['loss']:.4f}",
+                val_metric=f"{val_metrics[task_settings['metric_name']]:.4f}",
+            )
+
+            checkpoint = {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": lr_scheduler.state_dict(),
+                "val_loss": val_metrics["loss"],
+                "resolved_config": resolved_config,
+                "quality_supervised": quality_supervised,
+                "task": task_settings["task"],
+                "target_kind": task_settings["target_kind"],
+            }
+            torch.save(checkpoint, f"{model_path}/model_epoch_{epoch + 1}.pth")
+
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                torch.save(checkpoint, f"{model_path}/best_model.pth")
+    finally:
+        epoch_progress.close()
+
+    best_checkpoint = torch.load(f"{model_path}/best_model.pth", map_location=device)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    val_metrics = evaluate_model(
+        model,
+        val_loader,
+        device=device,
+        task_settings=task_settings,
+        quality_supervised=quality_supervised,
+        class_values=metadata.get("class_values"),
+        collect_outputs=True,
+    )
+    test_metrics = evaluate_model(
+        model,
+        test_loader,
+        device=device,
+        task_settings=task_settings,
+        quality_supervised=quality_supervised,
+        class_values=metadata.get("class_values"),
+        collect_outputs=True,
+    )
+    torch.save(
+        build_prediction_artifact(
+            split_name="val",
+            evaluation=val_metrics,
+            task_settings=task_settings,
+            metadata=metadata,
+        ),
+        f"{model_path}/val_predictions.pt",
+    )
+    torch.save(
+        build_prediction_artifact(
+            split_name="test",
+            evaluation=test_metrics,
+            task_settings=task_settings,
+            metadata=metadata,
+        ),
+        f"{model_path}/test_predictions.pt",
+    )
+    save_json_file(
+        {
+            "task": task_settings["task"],
+            "target_kind": task_settings["target_kind"],
+            "quality_supervised": quality_supervised,
+            "best_checkpoint_epoch": best_checkpoint["epoch"],
+            "best_validation_loss": best_checkpoint["val_loss"],
+            "metric_name": task_settings["metric_name"],
+            "val": build_metrics_record(val_metrics, task_settings=task_settings),
+            "test": build_metrics_record(test_metrics, task_settings=task_settings),
+        },
+        f"{model_path}/{DEFAULT_METRICS_PATH}",
+    )
+    hparam_metrics = {
+        "hparam/test_loss": test_metrics["loss"],
+        f"hparam/test_{task_settings['metric_name']}": test_metrics[
+            task_settings["metric_name"]
+        ],
+    }
+    writer.add_hparams(
+        {
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
+            "pairwise_neighbors": resolved_config["model"]["pairwise_neighbors"],
+            "model_dim": resolved_config["model"]["model_dim"],
+        },
+        hparam_metrics,
+    )
+    writer.close()
+    return test_metrics
+
+
+@click.command()
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Optional JSON config file. Defaults stay identical when omitted.",
+)
+@click.option(
+    "--data-path",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Override the configured preprocessing data directory.",
+)
+@click.option(
+    "--model-path",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Override the configured output directory for checkpoints and logs.",
+)
+def main(config_path, data_path, model_path):
+    resolved_config = resolve_train_config(
+        config_path=config_path,
+        overrides=get_cli_overrides(
+            data_path=data_path,
+            model_path=model_path,
+        ),
+    )
+    train_model(resolved_config=resolved_config)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,276 @@
+{
+  "exp_008_capacity_push": {
+    "class_1_by_prediction": {
+      "0": {
+        "count": 319,
+        "median_confidence": 0.5379727482795715,
+        "median_entropy": 0.9442488745813583,
+        "median_margin": 0.1898099184036255
+      },
+      "1": {
+        "count": 203,
+        "median_confidence": 0.40774452686309814,
+        "median_entropy": 1.0776259186036368,
+        "median_margin": 0.06414267420768738
+      },
+      "2": {
+        "count": 177,
+        "median_confidence": 0.5515168905258179,
+        "median_entropy": 0.9385489587401379,
+        "median_margin": 0.21370071172714233
+      }
+    },
+    "class_1_reliability": [
+      {
+        "bin_center": 0.05,
+        "bin_index": 0,
+        "bin_left": 0.0,
+        "bin_right": 0.1,
+        "count": 95,
+        "fraction_positive": 0.08421052631578947,
+        "mean_predicted_probability": 0.04707141939235091
+      },
+      {
+        "bin_center": 0.15000000000000002,
+        "bin_index": 1,
+        "bin_left": 0.1,
+        "bin_right": 0.2,
+        "count": 108,
+        "fraction_positive": 0.14814814814814814,
+        "mean_predicted_probability": 0.15425539582415862
+      },
+      {
+        "bin_center": 0.25,
+        "bin_index": 2,
+        "bin_left": 0.2,
+        "bin_right": 0.30000000000000004,
+        "count": 390,
+        "fraction_positive": 0.2794871794871795,
+        "mean_predicted_probability": 0.2639639742099322
+      },
+      {
+        "bin_center": 0.35000000000000003,
+        "bin_index": 3,
+        "bin_left": 0.30000000000000004,
+        "bin_right": 0.4,
+        "count": 1167,
+        "fraction_positive": 0.34704370179948585,
+        "mean_predicted_probability": 0.35720842504664785
+      },
+      {
+        "bin_center": 0.45,
+        "bin_index": 4,
+        "bin_left": 0.4,
+        "bin_right": 0.5,
+        "count": 390,
+        "fraction_positive": 0.40512820512820513,
+        "mean_predicted_probability": 0.41786893132405406
+      },
+      {
+        "bin_center": 0.55,
+        "bin_index": 5,
+        "bin_left": 0.5,
+        "bin_right": 0.6000000000000001,
+        "count": 6,
+        "fraction_positive": 0.5,
+        "mean_predicted_probability": 0.5525590280691782
+      },
+      {
+        "bin_center": 0.6500000000000001,
+        "bin_index": 6,
+        "bin_left": 0.6000000000000001,
+        "bin_right": 0.7000000000000001,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.6500000000000001
+      },
+      {
+        "bin_center": 0.75,
+        "bin_index": 7,
+        "bin_left": 0.7000000000000001,
+        "bin_right": 0.8,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.75
+      },
+      {
+        "bin_center": 0.8500000000000001,
+        "bin_index": 8,
+        "bin_left": 0.8,
+        "bin_right": 0.9,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.8500000000000001
+      },
+      {
+        "bin_center": 0.95,
+        "bin_index": 9,
+        "bin_left": 0.9,
+        "bin_right": 1.0,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.95
+      }
+    ],
+    "per_true_class": {
+      "0": {
+        "accuracy": 0.6950354609929078,
+        "median_confidence": 0.5322161316871643,
+        "median_entropy": 0.957715310150197,
+        "median_margin": 0.1836400032043457,
+        "support": 705
+      },
+      "1": {
+        "accuracy": 0.290414878397711,
+        "median_confidence": 0.48186153173446655,
+        "median_entropy": 1.0028878352281394,
+        "median_margin": 0.12124258279800415,
+        "support": 699
+      },
+      "2": {
+        "accuracy": 0.6050531914893617,
+        "median_confidence": 0.5554285049438477,
+        "median_entropy": 0.9374678903797845,
+        "median_margin": 0.21921990811824799,
+        "support": 752
+      }
+    }
+  },
+  "exp_009_capacity_push_retuned": {
+    "class_1_by_prediction": {
+      "0": {
+        "count": 299,
+        "median_confidence": 0.5150057673454285,
+        "median_entropy": 0.987725181388855,
+        "median_margin": 0.16923832893371582
+      },
+      "1": {
+        "count": 190,
+        "median_confidence": 0.38675040006637573,
+        "median_entropy": 1.0885837729600427,
+        "median_margin": 0.050208404660224915
+      },
+      "2": {
+        "count": 210,
+        "median_confidence": 0.5410125255584717,
+        "median_entropy": 0.9591067901389052,
+        "median_margin": 0.20885556936264038
+      }
+    },
+    "class_1_reliability": [
+      {
+        "bin_center": 0.05,
+        "bin_index": 0,
+        "bin_left": 0.0,
+        "bin_right": 0.1,
+        "count": 111,
+        "fraction_positive": 0.08108108108108109,
+        "mean_predicted_probability": 0.04883548016093571
+      },
+      {
+        "bin_center": 0.15000000000000002,
+        "bin_index": 1,
+        "bin_left": 0.1,
+        "bin_right": 0.2,
+        "count": 112,
+        "fraction_positive": 0.20535714285714285,
+        "mean_predicted_probability": 0.15457534597122244
+      },
+      {
+        "bin_center": 0.25,
+        "bin_index": 2,
+        "bin_left": 0.2,
+        "bin_right": 0.30000000000000004,
+        "count": 338,
+        "fraction_positive": 0.23964497041420119,
+        "mean_predicted_probability": 0.26601437029577574
+      },
+      {
+        "bin_center": 0.35000000000000003,
+        "bin_index": 3,
+        "bin_left": 0.30000000000000004,
+        "bin_right": 0.4,
+        "count": 1578,
+        "fraction_positive": 0.3656527249683143,
+        "mean_predicted_probability": 0.35782307488383447
+      },
+      {
+        "bin_center": 0.45,
+        "bin_index": 4,
+        "bin_left": 0.4,
+        "bin_right": 0.5,
+        "count": 17,
+        "fraction_positive": 0.5294117647058824,
+        "mean_predicted_probability": 0.40351100178325877
+      },
+      {
+        "bin_center": 0.55,
+        "bin_index": 5,
+        "bin_left": 0.5,
+        "bin_right": 0.6000000000000001,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.55
+      },
+      {
+        "bin_center": 0.6500000000000001,
+        "bin_index": 6,
+        "bin_left": 0.6000000000000001,
+        "bin_right": 0.7000000000000001,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.6500000000000001
+      },
+      {
+        "bin_center": 0.75,
+        "bin_index": 7,
+        "bin_left": 0.7000000000000001,
+        "bin_right": 0.8,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.75
+      },
+      {
+        "bin_center": 0.8500000000000001,
+        "bin_index": 8,
+        "bin_left": 0.8,
+        "bin_right": 0.9,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.8500000000000001
+      },
+      {
+        "bin_center": 0.95,
+        "bin_index": 9,
+        "bin_left": 0.9,
+        "bin_right": 1.0,
+        "count": 0,
+        "fraction_positive": NaN,
+        "mean_predicted_probability": 0.95
+      }
+    ],
+    "per_true_class": {
+      "0": {
+        "accuracy": 0.6907801418439716,
+        "median_confidence": 0.500186562538147,
+        "median_entropy": 0.9990587622300762,
+        "median_margin": 0.1534193754196167,
+        "support": 705
+      },
+      "1": {
+        "accuracy": 0.2718168812589413,
+        "median_confidence": 0.4653920531272888,
+        "median_entropy": 1.0287880739875956,
+        "median_margin": 0.10819268226623535,
+        "support": 699
+      },
+      "2": {
+        "accuracy": 0.6449468085106383,
+        "median_confidence": 0.5635948181152344,
+        "median_entropy": 0.9368656779864282,
+        "median_margin": 0.2404680699110031,
+        "support": 752
+      }
+    }
+  }
+}

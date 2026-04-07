@@ -1,0 +1,399 @@
+import json
+from pathlib import Path
+
+import click
+import torch
+from config import get_model_init_kwargs, resolve_train_config
+from eval import (
+    build_evaluation_summary,
+    multiclass_outputs_from_prediction,
+    resolve_task_settings,
+)
+from km3former import KM3Former
+from torch.utils.data import DataLoader, TensorDataset
+
+
+def load_metadata(metadata_path):
+    with open(metadata_path, "r", encoding="ascii") as metadata_file:
+        return json.load(metadata_file)
+
+
+def resolve_input_paths(
+    split=None,
+    data_path="./data",
+    hits_file=None,
+    raw_hits_file=None,
+    padding_mask_file=None,
+    target_file=None,
+):
+    if split is not None and any(
+        path is not None
+        for path in (hits_file, raw_hits_file, padding_mask_file, target_file)
+    ):
+        raise click.UsageError(
+            "Use either --split or explicit tensor paths, not both."
+        )
+
+    if split is not None:
+        default_target_file = f"{data_path}/{split}_targets.pt"
+        return {
+            "hits_file": f"{data_path}/{split}_hits.pt",
+            "raw_hits_file": f"{data_path}/{split}_hits_raw.pt",
+            "padding_mask_file": f"{data_path}/{split}_padding_mask.pt",
+            "target_file": (
+                default_target_file if Path(default_target_file).exists() else None
+            ),
+        }
+
+    if None in (hits_file, raw_hits_file, padding_mask_file):
+        raise click.UsageError(
+            "Explicit inference requires --hits-file, --raw-hits-file, and --padding-mask-file."
+        )
+
+    return {
+        "hits_file": hits_file,
+        "raw_hits_file": raw_hits_file,
+        "padding_mask_file": padding_mask_file,
+        "target_file": target_file,
+    }
+
+
+def load_inference_tensors(input_paths):
+    hits = torch.load(input_paths["hits_file"], map_location="cpu")
+    raw_hits = torch.load(input_paths["raw_hits_file"], map_location="cpu")
+    padding_mask = torch.load(input_paths["padding_mask_file"], map_location="cpu")
+    targets = None
+    if input_paths.get("target_file") is not None:
+        targets = torch.load(input_paths["target_file"], map_location="cpu")
+
+    lengths = {len(hits), len(raw_hits), len(padding_mask)}
+    if targets is not None:
+        lengths.add(len(targets))
+    if len(lengths) != 1:
+        raise ValueError("Inference tensors must share the same first dimension.")
+
+    return hits, raw_hits, padding_mask, targets
+
+
+def load_runtime_artifacts(data_path, metadata_path=None, stats_path=None):
+    metadata_path = metadata_path or f"{data_path}/metadata.json"
+    stats_path = stats_path or f"{data_path}/hits_stats.pt"
+
+    metadata = load_metadata(metadata_path=metadata_path)
+    # Loading feature stats here keeps inference tied to the saved preprocessing contract.
+    feature_stats = torch.load(stats_path, map_location="cpu")
+    if feature_stats["mean"].numel() != metadata["input_dim"]:
+        raise ValueError(
+            "Feature stats and metadata disagree on the input feature dimension."
+        )
+
+    return metadata, feature_stats, metadata_path, stats_path
+
+
+def build_model_from_checkpoint(metadata, checkpoint, device):
+    resolved_config = checkpoint.get("resolved_config") or resolve_train_config()
+    model = KM3Former(
+        **get_model_init_kwargs(
+            metadata=metadata,
+            resolved_config=resolved_config,
+        )
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, resolved_config
+
+
+def build_inference_loader(hits, raw_hits, padding_mask, batch_size, targets=None):
+    # Inference only needs the tensors consumed by the forward path, plus optional targets.
+    tensors = (hits, raw_hits, padding_mask)
+    if targets is not None:
+        tensors = tensors + (targets,)
+    dataset = TensorDataset(*tensors)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+@torch.no_grad()
+def predict_batches(model, data_loader, device, quality_supervised, task_settings):
+    predictions = []
+    quality_scores = [] if quality_supervised else None
+    targets = []
+
+    for batch in data_loader:
+        if len(batch) == 4:
+            hits, raw_hits, padding_mask, batch_targets = batch
+            targets.append(batch_targets.cpu())
+        else:
+            hits, raw_hits, padding_mask = batch
+        hits = hits.to(device)
+        raw_hits = raw_hits.to(device)
+        padding_mask = padding_mask.to(device)
+
+        model_output = model(
+            hits,
+            raw_hits=raw_hits,
+            padding_mask=padding_mask,
+            return_quality=quality_supervised,
+        )
+        if quality_supervised:
+            batch_predictions, batch_quality = model_output
+        else:
+            batch_predictions = model_output
+            batch_quality = None
+        predictions.append(batch_predictions.cpu())
+        if quality_supervised:
+            quality_scores.append(batch_quality.cpu())
+
+    raw_predictions = torch.cat(predictions, dim=0)
+    if task_settings["target_kind"] == "multiclass":
+        output = multiclass_outputs_from_prediction(
+            raw_predictions,
+            task_settings=task_settings,
+        )
+    else:
+        output = {"predictions": raw_predictions}
+    if quality_supervised:
+        output["quality"] = torch.cat(quality_scores, dim=0)
+    if targets:
+        output["targets"] = torch.cat(targets, dim=0)
+    return output
+
+
+def _make_json_serializable(value):
+    if isinstance(value, torch.Tensor):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {
+            key: _make_json_serializable(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_make_json_serializable(item) for item in value]
+    return value
+
+
+def save_inference_output(output_path, payload):
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    if output_path.endswith(".json"):
+        with open(output_path, "w", encoding="ascii") as output_file:
+            json.dump(
+                _make_json_serializable(payload),
+                output_file,
+                indent=2,
+                sort_keys=True,
+            )
+        return
+
+    torch.save(payload, output_path)
+
+
+def run_inference(
+    checkpoint_path,
+    output_path,
+    split=None,
+    data_path="./data",
+    hits_file=None,
+    raw_hits_file=None,
+    padding_mask_file=None,
+    target_file=None,
+    metadata_path=None,
+    stats_path=None,
+    batch_size=256,
+    device=None,
+):
+    input_paths = resolve_input_paths(
+        split=split,
+        data_path=data_path,
+        hits_file=hits_file,
+        raw_hits_file=raw_hits_file,
+        padding_mask_file=padding_mask_file,
+        target_file=target_file,
+    )
+    metadata, feature_stats, resolved_metadata_path, resolved_stats_path = (
+        load_runtime_artifacts(
+            data_path=data_path,
+            metadata_path=metadata_path,
+            stats_path=stats_path,
+        )
+    )
+    resolved_device = torch.device(
+        device
+        if device is not None
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    checkpoint = torch.load(checkpoint_path, map_location=resolved_device)
+    resolved_config = checkpoint.get("resolved_config") or resolve_train_config()
+    task_settings = resolve_task_settings(
+        metadata,
+        count_head=resolved_config["model"].get("count_head", "multiclass"),
+    )
+    hits, raw_hits, padding_mask, targets = load_inference_tensors(input_paths=input_paths)
+    quality_supervised = checkpoint.get(
+        "quality_supervised",
+        task_settings["supports_quality"],
+    ) and task_settings["supports_quality"]
+    model, resolved_config = build_model_from_checkpoint(
+        metadata=metadata,
+        checkpoint=checkpoint,
+        device=resolved_device,
+    )
+    data_loader = build_inference_loader(
+        hits=hits,
+        raw_hits=raw_hits,
+        padding_mask=padding_mask,
+        targets=targets,
+        batch_size=batch_size,
+    )
+    predictions = predict_batches(
+        model=model,
+        data_loader=data_loader,
+        device=resolved_device,
+        quality_supervised=quality_supervised,
+        task_settings=task_settings,
+    )
+
+    payload = {
+        "checkpoint_path": checkpoint_path,
+        "data_path": data_path,
+        "metadata_path": resolved_metadata_path,
+        "stats_path": resolved_stats_path,
+        "input_paths": input_paths,
+        "resolved_config": resolved_config,
+        "task": task_settings["task"],
+        "target_kind": task_settings["target_kind"],
+        "supports_quality": quality_supervised,
+        "feature_mean_shape": list(feature_stats["mean"].shape),
+        "feature_std_shape": list(feature_stats["std"].shape),
+        "predictions": predictions["predictions"],
+    }
+    if quality_supervised:
+        payload["quality"] = predictions["quality"]
+    if "confidence" in predictions:
+        payload["confidence"] = predictions["confidence"]
+    if task_settings["target_kind"] == "multiclass":
+        payload["probabilities"] = predictions["probabilities"]
+        payload["predicted_classes"] = predictions["predicted_classes"]
+        if "threshold_logits" in predictions:
+            payload["threshold_logits"] = predictions["threshold_logits"]
+        if "class_values" in metadata:
+            class_values = metadata["class_values"]
+            payload["predicted_labels"] = torch.tensor(
+                [class_values[index] for index in predictions["predicted_classes"].tolist()]
+            )
+    if "targets" in predictions:
+        payload["targets"] = predictions["targets"]
+        payload["metrics"] = build_evaluation_summary(
+            outputs=predictions,
+            task_settings=task_settings,
+            class_values=metadata.get("class_values"),
+        )
+    save_inference_output(output_path=output_path, payload=payload)
+    return payload
+
+
+@click.command()
+@click.option(
+    "--checkpoint-path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    required=True,
+    help="Checkpoint to load for inference.",
+)
+@click.option(
+    "--output-path",
+    type=click.Path(dir_okay=False, path_type=str),
+    required=True,
+    help="Where to save predictions. Use .pt for tensors or .json for a JSON payload.",
+)
+@click.option(
+    "--split",
+    type=click.Choice(["train", "val", "test"]),
+    default=None,
+    help="Read tensors from a named preprocessed split under --data-path.",
+)
+@click.option(
+    "--hits-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Explicit normalized hit tensor path.",
+)
+@click.option(
+    "--raw-hits-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Explicit pairwise-bias tensor path.",
+)
+@click.option(
+    "--padding-mask-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Explicit padding mask tensor path.",
+)
+@click.option(
+    "--target-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Optional explicit target tensor path for evaluation-ready outputs.",
+)
+@click.option(
+    "--data-path",
+    type=click.Path(file_okay=False, path_type=str),
+    default="./data",
+    show_default=True,
+    help="Base directory for preprocessed tensors and metadata.",
+)
+@click.option(
+    "--metadata-path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Optional explicit metadata path.",
+)
+@click.option(
+    "--stats-path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Optional explicit feature-statistics path.",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=256,
+    show_default=True,
+    help="Inference batch size.",
+)
+@click.option(
+    "--device",
+    type=str,
+    default=None,
+    help="Optional device override, for example cpu or cuda.",
+)
+def main(
+    checkpoint_path,
+    output_path,
+    split,
+    hits_file,
+    raw_hits_file,
+    padding_mask_file,
+    target_file,
+    data_path,
+    metadata_path,
+    stats_path,
+    batch_size,
+    device,
+):
+    run_inference(
+        checkpoint_path=checkpoint_path,
+        output_path=output_path,
+        split=split,
+        data_path=data_path,
+        hits_file=hits_file,
+        raw_hits_file=raw_hits_file,
+        padding_mask_file=padding_mask_file,
+        target_file=target_file,
+        metadata_path=metadata_path,
+        stats_path=stats_path,
+        batch_size=batch_size,
+        device=device,
+    )
+
+
+if __name__ == "__main__":
+    main()
